@@ -530,6 +530,18 @@ reduction and offload ordering and is not covered; a warning is logged.
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
 | Enable offloading of optimizer state to CPU or NVMe, and optimizer computation to CPU. This frees up GPU memory for larger models or batch sizes. Valid for ZeRO stage 1, 2, 3. See [here](#optimizer-offloading) for more details. | `False` |
 
+***cpu_bf16_gradient_accumulation***: [boolean]
+
+| Description | Default |
+| ----------- | ------- |
+| Accumulate intermediate BF16 gradient partitions on the CPU during ZeRO-3 CPU optimizer offload. Requires BF16 model and accumulation dtype, pinned CPU optimizer offload, DeepSpeedCPUAdam, AVX-512 and an asynchronous accelerator. Coalesced gradient reduction is unsupported. | `false` |
+
+***cpu_fp16_gradient_accumulation***: [boolean]
+
+| Description | Default |
+| ----------- | ------- |
+| Accumulate intermediate FP16 gradient partitions on the CPU during ZeRO-3 CPU optimizer offload. Requires FP16 model and accumulation dtype, pinned CPU optimizer offload, DeepSpeedCPUAdam, AVX-512 and an asynchronous accelerator. Coalesced gradient reduction is unsupported. | `false` |
+
 ***stage3_max_live_parameters***: [integer]
 
 | Description                                                                                                                         | Default |

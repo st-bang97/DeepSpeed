@@ -337,6 +337,8 @@ int ds_adam_step(int optimizer_id,
                  torch::Tensor& exp_avg_sq);
 
 bool ds_adam_fused_supported();
+void ds_adam_bf16_accumulate(torch::Tensor& dst, torch::Tensor& src);
+void ds_adam_fp16_accumulate(torch::Tensor& dst, torch::Tensor& src);
 int ds_adam_step_fused_chunked(int optimizer_id,
                                size_t step,
                                float lr,

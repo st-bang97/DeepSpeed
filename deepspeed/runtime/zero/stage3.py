@@ -10,6 +10,7 @@ import itertools
 from typing import Deque, Dict, Set, List, Container, Optional
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 
 from deepspeed import comm as dist
 from deepspeed.comm import pg_utils
@@ -197,6 +198,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         postscale_gradients=True,
         gradient_predivide_factor=1.0,
         gradient_accumulation_steps=1,
+        cpu_bf16_gradient_accumulation=False,
+        cpu_fp16_gradient_accumulation=False,
         elastic_checkpoint=False,
         aio_config=None,
         all2all_process_group=None,
@@ -295,6 +298,27 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.persistent_parameters = self.parameter_offload.persistent_parameters
         self._configure_offloading(offload_optimizer_config, offload_param_config)
+        if cpu_bf16_gradient_accumulation and cpu_fp16_gradient_accumulation:
+            raise ValueError("Only one CPU gradient accumulation precision may be enabled")
+        self.cpu_low_precision_gradient_accumulation = (cpu_bf16_gradient_accumulation
+                                                        or cpu_fp16_gradient_accumulation)
+        self._cpu_low_precision_accum_futures = {}
+        self._cpu_low_precision_copy_events = {}
+        self._cpu_low_precision_scratch = {}
+        self._cpu_low_precision_executor = None
+        if self.cpu_low_precision_gradient_accumulation:
+            expected_dtype = torch.bfloat16 if cpu_bf16_gradient_accumulation else torch.float16
+            accumulation_method = 'bf16_accumulate' if cpu_bf16_gradient_accumulation else 'fp16_accumulate'
+            if (not self.offload_optimizer or self.swap_optimizer or not self.offload_optimizer_pin_memory
+                    or self.dtype != expected_dtype or self.gradient_accumulation_dtype != expected_dtype
+                    or type(self.optimizer) is not DeepSpeedCPUAdam or not self.optimizer.fused_adam_available
+                    or not hasattr(self.optimizer.ds_opt_adam, accumulation_method)
+                    or get_accelerator().is_synchronized_device()):
+                raise ValueError("CPU gradient accumulation requires matching FP16/BF16 model and accumulation "
+                                 "dtype, pinned ZeRO-3 CPU optimizer offload, DeepSpeedCPUAdam, "
+                                 "an asynchronous accelerator and AVX-512")
+            self._cpu_low_precision_accumulate = getattr(self.optimizer.ds_opt_adam, accumulation_method)
+            self._cpu_low_precision_executor = ThreadPoolExecutor(max_workers=2)
 
         def _enforce_optimizer_offload():
             assert self.offload_optimizer and type(self.optimizer) == DeepSpeedCPUAdam, \
@@ -542,6 +566,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             see_memory_usage("After initializing ZeRO optimizer", force=False)
 
     def destroy(self):
+        self._wait_for_cpu_low_precision_accumulation()
+        if self._cpu_low_precision_executor is not None:
+            self._cpu_low_precision_executor.shutdown(wait=True)
+            self._cpu_low_precision_scratch.clear()
         self.parameter_offload.destroy()
         self._clear_muon_allgather_buffers()
         for hook in self._grad_acc_hooks:
@@ -2031,6 +2059,17 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         return total_norm.cpu()
 
+    def _wait_for_cpu_low_precision_accumulation(self, param_id=None):
+        param_ids = [param_id] if param_id is not None else set(self._cpu_low_precision_accum_futures) | set(
+            self._cpu_low_precision_copy_events)
+        for current_id in param_ids:
+            future = self._cpu_low_precision_accum_futures.pop(current_id, None)
+            if future is not None:
+                future.result()
+            event = self._cpu_low_precision_copy_events.pop(current_id, None)
+            if event is not None:
+                event.synchronize()
+
     @instrument_w_nvtx
     def partition_grads(self, params_to_release: List[Parameter], grad_partitions: List[Tensor]) -> None:
         offload_fp32_gradients = {}
@@ -2047,6 +2086,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             # Record active param so unmanaged offload finalize skips params unused this window.
             self._offload_boundary_param_ids.add(param.ds_id)
 
+            if self.cpu_low_precision_gradient_accumulation:
+                if self._coalesce_grad_reduction:
+                    raise RuntimeError("CPU gradient accumulation does not support coalesced gradient reduction")
+                self._wait_for_cpu_low_precision_accumulation(param.ds_id)
+
             # move or accumulate gradient partition to target buffer
             grad_buffer = self.__param_id_to_grad_partition[param.ds_id].narrow(0, 0, grad_partition.numel())
             buffers.append(grad_buffer)
@@ -2055,6 +2099,22 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 # ensure grad buffer is a CUDA buffer to speed up the next few
                 # operations and so it can be used asynchronously
                 grad_buffer = grad_buffer.to(grad_partition.device, non_blocking=True)
+            elif self.cpu_low_precision_gradient_accumulation and not self.is_gradient_accumulation_boundary():
+                scratch = self._cpu_low_precision_scratch.get(param.ds_id)
+                if scratch is None:
+                    scratch = get_accelerator().pin_memory(torch.empty_like(grad_buffer, device='cpu'))
+                    self._cpu_low_precision_scratch[param.ds_id] = scratch
+                scratch.copy_(grad_partition.view(scratch.shape), non_blocking=True)
+                grad_partition.record_stream(get_accelerator().current_stream())
+                copy_event = get_accelerator().Event()
+                copy_event.record(get_accelerator().current_stream())
+
+                def accumulate(event=copy_event, dst=grad_buffer, src=scratch):
+                    event.synchronize()
+                    self._cpu_low_precision_accumulate(dst, src)
+
+                self._cpu_low_precision_accum_futures[param.ds_id] = self._cpu_low_precision_executor.submit(
+                    accumulate)
             elif get_accelerator().on_accelerator(grad_buffer):
                 grad_buffer.add_(grad_partition.to(self.gradient_accumulation_dtype).view(grad_buffer.shape))
             else:
@@ -2066,6 +2126,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 # ensure grad buffer is a CUDA buffer to speed up the next few
                 # operations and so it can be used asynchronously
                 grad_buffer = cuda_grad_buffer
+
+            if self.cpu_low_precision_gradient_accumulation and self.micro_step_id == 0:
+                copy_event = get_accelerator().Event()
+                copy_event.record(get_accelerator().current_stream())
+                self._cpu_low_precision_copy_events[param.ds_id] = copy_event
 
             # offload the gradient partition if applicable
             if self.offload_optimizer:
@@ -2566,6 +2631,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.norm_for_param_grads = {}
 
     def _pre_step(self):
+        self._wait_for_cpu_low_precision_accumulation()
         self.micro_step_id = 0
         self._offload_boundary_param_ids = set()
         # Also reset the epilogue flag so the next iteration starts fresh.

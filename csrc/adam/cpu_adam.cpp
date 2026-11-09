@@ -10,6 +10,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     using namespace pybind11::literals;
     m.def("adam_update", &ds_adam_step, "DeepSpeed CPU Adam update (C++)");
     m.def("adam_fused_supported", &ds_adam_fused_supported);
+    m.def("bf16_accumulate",
+          &ds_adam_bf16_accumulate,
+          pybind11::call_guard<pybind11::gil_scoped_release>());
+    m.def("fp16_accumulate",
+          &ds_adam_fp16_accumulate,
+          pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("adam_update_fused", &ds_adam_step_fused);
     m.def("adam_update_fused_chunked", &ds_adam_step_fused_chunked);
     m.def("adam_rollback", &ds_adam_rollback, "DeepSpeed CPU Adam rollback (C++)");

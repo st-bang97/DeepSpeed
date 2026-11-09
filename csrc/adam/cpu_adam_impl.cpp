@@ -302,6 +302,58 @@ bool ds_adam_fused_supported()
 #endif
 }
 
+#if defined(__AVX512__)
+template <typename T>
+void cpu_adam_accumulate_half(torch::Tensor& dst, torch::Tensor& src)
+{
+    auto* dst_ptr = dst.data_ptr<T>();
+    auto* src_ptr = src.data_ptr<T>();
+    const size_t count = dst.numel();
+    const size_t rounded = ROUND_DOWN(count, SIMD_WIDTH);
+    for (size_t i = 0; i < rounded; i += SIMD_WIDTH) {
+        AVX_Data left[1];
+        AVX_Data right[1];
+        simd_load<1>(left, dst_ptr + i);
+        simd_load<1>(right, src_ptr + i);
+        simd_add<1>(left, left, right);
+        if constexpr (std::is_same_v<T, c10::Half>) {
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst_ptr + i),
+                                _mm512_cvtps_ph(left[0].data, _MM_FROUND_TO_NEAREST_INT));
+        } else {
+            simd_store<1>(dst_ptr + i, left);
+        }
+    }
+    for (size_t i = rounded; i < count; ++i) {
+        dst_ptr[i] = T(float(dst_ptr[i]) + float(src_ptr[i]));
+    }
+}
+#endif
+
+void ds_adam_bf16_accumulate(torch::Tensor& dst, torch::Tensor& src)
+{
+    TORCH_CHECK(ds_adam_fused_supported(), "BF16 accumulation requires AVX-512");
+    TORCH_CHECK(dst.device().is_cpu() && src.device().is_cpu() &&
+                    dst.scalar_type() == torch::kBFloat16 &&
+                    src.scalar_type() == torch::kBFloat16 && dst.is_contiguous() &&
+                    src.is_contiguous() && dst.numel() == src.numel(),
+                "BF16 accumulation requires contiguous CPU BF16 tensors of equal size");
+#if defined(__AVX512__)
+    cpu_adam_accumulate_half<c10::BFloat16>(dst, src);
+#endif
+}
+
+void ds_adam_fp16_accumulate(torch::Tensor& dst, torch::Tensor& src)
+{
+    TORCH_CHECK(ds_adam_fused_supported(), "FP16 accumulation requires AVX-512");
+    TORCH_CHECK(dst.device().is_cpu() && src.device().is_cpu() &&
+                    dst.scalar_type() == torch::kFloat16 && src.scalar_type() == torch::kFloat16 &&
+                    dst.is_contiguous() && src.is_contiguous() && dst.numel() == src.numel(),
+                "FP16 accumulation requires contiguous CPU FP16 tensors of equal size");
+#if defined(__AVX512__)
+    cpu_adam_accumulate_half<c10::Half>(dst, src);
+#endif
+}
+
 int ds_adam_step_fused_chunked(int optimizer_id,
                                size_t step,
                                float lr,

@@ -656,6 +656,37 @@ def test_cpu_adam_fused_scale_and_bf16_output(model_size, adamw_mode):
         assert torch.equal(actual_state['exp_avg_sq'], expected_state['exp_avg_sq'])
 
 
+@pytest.mark.parametrize('size', [0, 1, 15, 16, 17, 129, 1024])
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize('offset', [0, 1])
+def test_cpu_adam_low_precision_accumulation(size, dtype, offset):
+    from deepspeed.ops.op_builder import CPUAdamBuilder
+
+    native = CPUAdamBuilder().load()
+    if not native.adam_fused_supported():
+        pytest.skip('AVX-512 CPUAdam build required')
+    torch.manual_seed(1234 + size)
+    initial = torch.randn(size + offset).to(dtype)[offset:]
+    source = torch.randn(size + offset).to(dtype)[offset:]
+    expected = (initial.float() + source.float()).to(dtype)
+    accumulate = native.bf16_accumulate if dtype == torch.bfloat16 else native.fp16_accumulate
+    accumulate(initial, source)
+    assert torch.equal(initial, expected)
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
+def test_cpu_adam_low_precision_accumulation_nonfinite(dtype):
+    native = CPUAdamBuilder().load()
+    if not native.adam_fused_supported():
+        pytest.skip('AVX-512 CPUAdam build required')
+    initial = torch.tensor([float('inf'), -float('inf'), float('nan'), 65504.0] * 5, dtype=dtype)
+    source = torch.tensor([-float('inf'), 1.0, 2.0, 65504.0] * 5, dtype=dtype)
+    expected = (initial.float() + source.float()).to(dtype)
+    accumulate = native.bf16_accumulate if dtype == torch.bfloat16 else native.fp16_accumulate
+    accumulate(initial, source)
+    torch.testing.assert_close(initial, expected, rtol=0, atol=0, equal_nan=True)
+
+
 def test_cpu_adam_fused_rejects_invalid_output():
     param = torch.nn.Parameter(torch.ones(16))
     optimizer = DeepSpeedCPUAdam([param])

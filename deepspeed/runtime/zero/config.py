@@ -176,6 +176,12 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     for :any:`DeepSpeedZeroOffloadOptimizerConfig`.
     """
 
+    cpu_bf16_gradient_accumulation: bool = False
+    """Accumulate intermediate BF16 ZeRO-3 CPU-offloaded gradients on the CPU."""
+
+    cpu_fp16_gradient_accumulation: bool = False
+    """Accumulate intermediate FP16 ZeRO-3 CPU-offloaded gradients on the CPU."""
+
     zenflow: Optional[ZenFlowConfig] = None
     """Enable ZenFlow"""
 
@@ -390,6 +396,15 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     def compute_grad_norm_valid(self):
         if not self.compute_grad_norm and self.stage not in (ZeroStageEnum.optimizer_states, ZeroStageEnum.gradients):
             raise ValueError("compute_grad_norm=false is supported only with ZeRO Stage 1 or 2")
+        return self
+
+    @model_validator(mode="after")
+    def cpu_gradient_options_valid(self):
+        if (self.cpu_bf16_gradient_accumulation
+                or self.cpu_fp16_gradient_accumulation) and self.stage != ZeroStageEnum.weights:
+            raise ValueError("CPU gradient offload options require ZeRO stage 3")
+        if self.cpu_bf16_gradient_accumulation and self.cpu_fp16_gradient_accumulation:
+            raise ValueError("Only one CPU gradient accumulation precision may be enabled")
         return self
 
     @model_validator(mode="after")

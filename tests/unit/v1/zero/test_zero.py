@@ -28,7 +28,7 @@ from deepspeed.runtime.zero.stage_1_and_2 import split_half_float_double
 from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
 from deepspeed.runtime.zero.utils import ZeRORuntimeException
 from deepspeed.accelerator import get_accelerator
-from deepspeed.utils import safe_get_full_fp32_param, safe_get_full_grad
+from deepspeed.utils import safe_get_full_fp32_param, safe_get_full_grad, safe_get_full_optimizer_state
 
 
 class TestSplitHalfFloatDouble:
@@ -2299,8 +2299,6 @@ class TestZero3FusedCPUAdam(DistributedTest):
             'zero_force_ds_cpu_optimizer': False,
             'zero_optimization': {
                 'stage': 3,
-                'reduce_bucket_size': 1024,
-                'stage3_prefetch_bucket_size': 1024,
                 'offload_optimizer': {
                     'device': 'cpu'
                 }
@@ -2325,3 +2323,66 @@ class TestZero3FusedCPUAdam(DistributedTest):
         actual = run(DeepSpeedCPUAdam)
         for expected_param, actual_param in zip(expected, actual):
             torch.testing.assert_close(actual_param, expected_param, rtol=1e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize('precision', ['bf16', 'fp16'])
+@pytest.mark.parametrize('accumulation_steps', [1, 2, 4, 8])
+class TestZero3CPULowPrecisionAccumulation(DistributedTest):
+    world_size = [1, 2]
+
+    def test_matches_zero3(self, accumulation_steps, precision):
+        from deepspeed.ops.op_builder import CPUAdamBuilder
+
+        if get_accelerator().is_synchronized_device() or not CPUAdamBuilder().load().adam_fused_supported():
+            pytest.skip('asynchronous accelerator and AVX-512 CPUAdam build required')
+        torch.manual_seed(1234)
+        initial_model = SimpleModel(hidden_dim=16, nlayers=2)
+        device = get_accelerator().current_device_name()
+        dtype = torch.bfloat16 if precision == 'bf16' else torch.float16
+        inputs = [torch.randn(2, 16, device=device, dtype=dtype) for _ in range(2 * accumulation_steps)]
+        labels = [torch.randint(0, 16, (2, ), device=device) for _ in range(2 * accumulation_steps)]
+
+        def run(cpu_accumulation):
+            config = {
+                'train_micro_batch_size_per_gpu': 2,
+                'gradient_accumulation_steps': accumulation_steps,
+                precision: {
+                    'enabled': True
+                },
+                'optimizer': {
+                    'type': 'AdamW',
+                    'params': {
+                        'lr': 0.001
+                    }
+                },
+                'zero_optimization': {
+                    'stage': 3,
+                    'reduce_bucket_size': 1024,
+                    'stage3_prefetch_bucket_size': 1024,
+                    'offload_optimizer': {
+                        'device': 'cpu',
+                        'pin_memory': True
+                    },
+                    f'cpu_{precision}_gradient_accumulation': cpu_accumulation,
+                },
+            }
+            if precision == 'fp16':
+                config['fp16']['loss_scale'] = 128
+            model = deepcopy(initial_model)
+            engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            try:
+                for x, y in zip(inputs, labels):
+                    engine.backward(engine(x, y))
+                    engine.step()
+                params = [safe_get_full_fp32_param(p).clone() for p in engine.module.parameters()]
+                momentum = [safe_get_full_optimizer_state(p, 'exp_avg').clone() for p in engine.module.parameters()]
+                variance = [safe_get_full_optimizer_state(p, 'exp_avg_sq').clone() for p in engine.module.parameters()]
+                return params, momentum, variance
+            finally:
+                engine.destroy()
+
+        expected = run(False)
+        actual = run(True)
+        for expected_group, actual_group in zip(expected, actual):
+            for expected_tensor, actual_tensor in zip(expected_group, actual_group):
+                assert torch.equal(actual_tensor, expected_tensor)
