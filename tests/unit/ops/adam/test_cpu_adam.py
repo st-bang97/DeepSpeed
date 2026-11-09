@@ -687,6 +687,38 @@ def test_cpu_adam_low_precision_accumulation_nonfinite(dtype):
     torch.testing.assert_close(initial, expected, rtol=0, atol=0, equal_nan=True)
 
 
+@pytest.mark.parametrize('size', [3, 16, 17, 128, 129])
+@pytest.mark.parametrize('grad_dtype', [torch.float16, torch.bfloat16])
+def test_cpu_adam_low_precision_gradient(size, grad_dtype):
+    torch.manual_seed(1234 + size)
+    initial = torch.randn(size)
+    actual = torch.nn.Parameter(initial.clone())
+    expected = torch.nn.Parameter(initial.clone())
+    actual_optimizer = DeepSpeedCPUAdam([actual], lr=0.001)
+    expected_optimizer = DeepSpeedCPUAdam([expected], lr=0.001)
+    native = actual_optimizer.ds_opt_adam
+    if not native.adam_fused_supported():
+        pytest.skip('AVX-512 CPUAdam build required')
+    state = actual_optimizer.state[actual]
+    state['exp_avg'] = torch.zeros_like(initial)
+    state['exp_avg_sq'] = torch.zeros_like(initial)
+    state['step'] = 0
+    for step in range(1, 4):
+        gradient = torch.randn(size).to(grad_dtype)
+        expected.grad = gradient.float() * 0.125
+        expected_optimizer.step()
+        scratch = torch.zeros_like(initial)
+        output = torch.empty(size, dtype=torch.bfloat16)
+        native.adam_update_low_precision(actual_optimizer.opt_id, step, 0.001, 0.9, 0.999, 1e-8, 0.0, True,
+                                         actual.data, scratch, state['exp_avg'], state['exp_avg_sq'], 0.125, gradient,
+                                         output)
+        assert torch.equal(actual, expected)
+        assert torch.equal(scratch, expected.grad)
+        assert torch.equal(output, expected.to(torch.bfloat16))
+        assert torch.equal(state['exp_avg'], expected_optimizer.state[expected]['exp_avg'])
+        assert torch.equal(state['exp_avg_sq'], expected_optimizer.state[expected]['exp_avg_sq'])
+
+
 def test_cpu_adam_fused_rejects_invalid_output():
     param = torch.nn.Parameter(torch.ones(16))
     optimizer = DeepSpeedCPUAdam([param])

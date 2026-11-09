@@ -85,6 +85,11 @@ public:
         _bf16_output = output;
         _fused_base = base;
     }
+    void set_low_precision_gradient(const void* grad, bool is_bf16)
+    {
+        _low_precision_gradient = grad;
+        _low_precision_is_bf16 = is_bf16;
+    }
     inline void IncrementStep(size_t step, float beta1, float beta2)
     {
         if (beta1 != _betta1 || beta2 != _betta2) {
@@ -123,6 +128,8 @@ public:
     }
 
 private:
+    const void* _low_precision_gradient = nullptr;
+    bool _low_precision_is_bf16 = false;
     float* _fused_base = nullptr;
     float _grad_scale = 1.0f;
     c10::BFloat16* _bf16_output = nullptr;
@@ -161,7 +168,8 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
 #if defined(__AVX512__)
     size_t fused_offset = 0;
     if constexpr (std::is_same_v<ds_params_precision_t, float>) {
-        if (_bf16_output != nullptr) fused_offset = _params - _fused_base;
+        if (_bf16_output != nullptr || _low_precision_gradient != nullptr)
+            fused_offset = _params - _fused_base;
     }
 #endif
     size_t new_rounded_size = 0;
@@ -200,9 +208,27 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
 #pragma omp parallel for if (parallel)
         for (size_t i = t; i < offset; i += SIMD_WIDTH * span) {
             AVX_Data grad_4[span];
-            simd_load<span>(grad_4, grads + i);
 #if defined(__AVX512__)
-            if (_bf16_output != nullptr) {
+            if (_low_precision_gradient != nullptr) {
+                size_t offset = fused_offset + i;
+                if (_low_precision_is_bf16) {
+                    simd_load<span>(grad_4,
+                                    const_cast<c10::BFloat16*>(static_cast<const c10::BFloat16*>(
+                                        _low_precision_gradient)) +
+                                        offset);
+                } else {
+                    simd_load<span>(grad_4,
+                                    const_cast<c10::Half*>(
+                                        static_cast<const c10::Half*>(_low_precision_gradient)) +
+                                        offset);
+                }
+            } else
+#endif
+            {
+                simd_load<span>(grad_4, grads + i);
+            }
+#if defined(__AVX512__)
+            if (_bf16_output != nullptr || _low_precision_gradient != nullptr) {
                 AVX_Data scale;
                 scale.data = SIMD_SET(_grad_scale);
                 simd_mul<span>(grad_4, grad_4, scale);
@@ -339,6 +365,21 @@ int ds_adam_step(int optimizer_id,
 bool ds_adam_fused_supported();
 void ds_adam_bf16_accumulate(torch::Tensor& dst, torch::Tensor& src);
 void ds_adam_fp16_accumulate(torch::Tensor& dst, torch::Tensor& src);
+int ds_adam_step_low_precision(int optimizer_id,
+                               size_t step,
+                               float lr,
+                               float beta1,
+                               float beta2,
+                               float epsilon,
+                               float weight_decay,
+                               bool bias_correction,
+                               torch::Tensor& params,
+                               torch::Tensor& grads,
+                               torch::Tensor& exp_avg,
+                               torch::Tensor& exp_avg_sq,
+                               float grad_scale,
+                               torch::Tensor& lowp_grad,
+                               torch::Tensor& bf16_output);
 int ds_adam_step_fused_chunked(int optimizer_id,
                                size_t step,
                                float lr,

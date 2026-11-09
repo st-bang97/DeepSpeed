@@ -530,6 +530,12 @@ reduction and offload ordering and is not covered; a warning is logged.
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
 | Enable offloading of optimizer state to CPU or NVMe, and optimizer computation to CPU. This frees up GPU memory for larger models or batch sizes. Valid for ZeRO stage 1, 2, 3. See [here](#optimizer-offloading) for more details. | `False` |
 
+***low_precision_gradient_offload***: [boolean]
+
+| Description | Default |
+| ----------- | ------- |
+| Offload FP16/BF16 gradient partitions before promoting them to FP32 in the AVX-512 CPUAdam kernel. Requires ZeRO-3, matching model and accumulation dtypes, pinned CPU optimizer offload, FP32 master weights and optimizer states, and DeepSpeedCPUAdam. The existing FP32 gradient buffers are retained for gradient APIs and fallback when a subgroup has unused parameters or its gradients are accessed before the optimizer step. BF16 output is generated in the existing CPU parameter buffer when parameter offload is enabled; GPU parameter partitions use the existing parameter reassignment path. | `false` |
+
 ***cpu_bf16_gradient_accumulation***: [boolean]
 
 | Description | Default |

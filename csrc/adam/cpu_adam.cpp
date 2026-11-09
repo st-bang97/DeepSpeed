@@ -18,6 +18,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           pybind11::call_guard<pybind11::gil_scoped_release>());
     m.def("adam_update_fused", &ds_adam_step_fused);
     m.def("adam_update_fused_chunked", &ds_adam_step_fused_chunked);
+    m.def("adam_update_low_precision", &ds_adam_step_low_precision);
     m.def("adam_rollback", &ds_adam_rollback, "DeepSpeed CPU Adam rollback (C++)");
     m.def("create_adam", &create_adam_optimizer, "DeepSpeed CPU Adam (C++)");
     m.def("destroy_adam", &destroy_adam_optimizer, "DeepSpeed CPU Adam destroy (C++)");

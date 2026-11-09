@@ -176,6 +176,9 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
     for :any:`DeepSpeedZeroOffloadOptimizerConfig`.
     """
 
+    low_precision_gradient_offload: bool = False
+    """Transfer FP16/BF16 gradients to the CPU before conversion to FP32."""
+
     cpu_bf16_gradient_accumulation: bool = False
     """Accumulate intermediate BF16 ZeRO-3 CPU-offloaded gradients on the CPU."""
 
@@ -400,8 +403,8 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
 
     @model_validator(mode="after")
     def cpu_gradient_options_valid(self):
-        if (self.cpu_bf16_gradient_accumulation
-                or self.cpu_fp16_gradient_accumulation) and self.stage != ZeroStageEnum.weights:
+        if (self.cpu_bf16_gradient_accumulation or self.cpu_fp16_gradient_accumulation
+                or self.low_precision_gradient_offload) and self.stage != ZeroStageEnum.weights:
             raise ValueError("CPU gradient offload options require ZeRO stage 3")
         if self.cpu_bf16_gradient_accumulation and self.cpu_fp16_gradient_accumulation:
             raise ValueError("Only one CPU gradient accumulation precision may be enabled")

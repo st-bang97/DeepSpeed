@@ -2275,10 +2275,11 @@ class TestZero3ClientModuleID(DistributedTest):
 
 
 @pytest.mark.parametrize('clip', [0.0, 0.01])
+@pytest.mark.parametrize('param_offload', [False, True])
 class TestZero3FusedCPUAdam(DistributedTest):
     world_size = [1, 2]
 
-    def test_matches_torch_adamw(self, clip):
+    def test_matches_torch_adamw(self, clip, param_offload):
         from deepspeed.ops.adam import DeepSpeedCPUAdam
         from deepspeed.ops.op_builder import CPUAdamBuilder
 
@@ -2304,6 +2305,9 @@ class TestZero3FusedCPUAdam(DistributedTest):
                 }
             },
         }
+
+        if param_offload:
+            config['zero_optimization']['offload_param'] = {'device': 'cpu', 'pin_memory': True}
 
         def run(optimizer_type):
             model = deepcopy(initial_model)
@@ -2357,8 +2361,6 @@ class TestZero3CPULowPrecisionAccumulation(DistributedTest):
                 },
                 'zero_optimization': {
                     'stage': 3,
-                    'reduce_bucket_size': 1024,
-                    'stage3_prefetch_bucket_size': 1024,
                     'offload_optimizer': {
                         'device': 'cpu',
                         'pin_memory': True
@@ -2386,3 +2388,446 @@ class TestZero3CPULowPrecisionAccumulation(DistributedTest):
         for expected_group, actual_group in zip(expected, actual):
             for expected_tensor, actual_tensor in zip(expected_group, actual_group):
                 assert torch.equal(actual_tensor, expected_tensor)
+
+
+@pytest.mark.parametrize('precision', ['bf16', 'fp16'])
+@pytest.mark.parametrize('clip', [0.0, 0.01])
+class TestZero3LowPrecisionGradientOffload(DistributedTest):
+    world_size = [1, 2]
+
+    def test_matches_zero3(self, precision, clip):
+        from deepspeed.ops.op_builder import CPUAdamBuilder
+
+        if get_accelerator().is_synchronized_device() or not CPUAdamBuilder().load().adam_fused_supported():
+            pytest.skip('asynchronous accelerator and AVX-512 CPUAdam build required')
+        torch.manual_seed(1234)
+        model = SimpleModel(hidden_dim=16, nlayers=2)
+        dtype = torch.bfloat16 if precision == 'bf16' else torch.float16
+        device = get_accelerator().current_device_name()
+        inputs = [torch.randn(2, 16, device=device, dtype=dtype) for _ in range(4)]
+        labels = [torch.randint(0, 16, (2, ), device=device) for _ in range(4)]
+
+        def run(enabled):
+            model_copy = deepcopy(model)
+            config = {
+                'train_micro_batch_size_per_gpu': 2,
+                'gradient_accumulation_steps': 2,
+                'gradient_clipping': clip,
+                precision: {
+                    'enabled': True
+                },
+                'optimizer': {
+                    'type': 'AdamW',
+                    'params': {
+                        'lr': 0.001
+                    }
+                },
+                'zero_optimization': {
+                    'stage': 3,
+                    'offload_optimizer': {
+                        'device': 'cpu',
+                        'pin_memory': True
+                    },
+                    'low_precision_gradient_offload': enabled,
+                },
+            }
+            if precision == 'fp16':
+                config['fp16']['loss_scale'] = 128
+            engine, _, _, _ = deepspeed.initialize(model=model_copy,
+                                                   model_parameters=model_copy.parameters(),
+                                                   config=config)
+            try:
+                for x, y in zip(inputs, labels):
+                    engine.backward(engine(x, y))
+                    engine.step()
+                params = [safe_get_full_fp32_param(p).clone() for p in engine.module.parameters()]
+                gradients = [safe_get_full_grad(p).clone() for p in engine.module.parameters()]
+                momentum = [safe_get_full_optimizer_state(p, 'exp_avg').clone() for p in engine.module.parameters()]
+                variance = [safe_get_full_optimizer_state(p, 'exp_avg_sq').clone() for p in engine.module.parameters()]
+                return params, gradients, momentum, variance
+            finally:
+                engine.destroy()
+
+        expected = run(False)
+        actual = run(True)
+        for expected_group, actual_group in zip(expected, actual):
+            for expected_tensor, actual_tensor in zip(expected_group, actual_group):
+                assert torch.equal(actual_tensor, expected_tensor)
+
+
+class TestZero3LowPrecisionGradientFallback(DistributedTest):
+    world_size = [1, 2]
+
+    def test_unused_parameter_and_gradient_access(self):
+        from deepspeed.ops.op_builder import CPUAdamBuilder
+
+        if get_accelerator().is_synchronized_device() or not CPUAdamBuilder().load().adam_fused_supported():
+            pytest.skip('asynchronous accelerator and AVX-512 CPUAdam build required')
+
+        class ConditionalModel(Module):
+
+            def __init__(self):
+                super().__init__()
+                self.first = Linear(16, 16)
+                self.second = Linear(16, 16)
+
+            def forward(self, x, use_second):
+                x = self.first(x)
+                if use_second:
+                    x = self.second(x)
+                return x.float().square().mean()
+
+        torch.manual_seed(1234)
+        initial_model = ConditionalModel()
+        inputs = [
+            torch.randn(2, 16, device=get_accelerator().current_device_name(), dtype=torch.bfloat16) for _ in range(3)
+        ]
+
+        def run(enabled):
+            model = deepcopy(initial_model)
+            config = {
+                'train_micro_batch_size_per_gpu': 2,
+                'bf16': {
+                    'enabled': True
+                },
+                'optimizer': {
+                    'type': 'AdamW',
+                    'params': {
+                        'lr': 0.001
+                    }
+                },
+                'zero_optimization': {
+                    'stage': 3,
+                    'offload_optimizer': {
+                        'device': 'cpu',
+                        'pin_memory': True
+                    },
+                    'low_precision_gradient_offload': enabled,
+                },
+            }
+            engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            try:
+                observed_grads = []
+                for step, x in enumerate(inputs):
+                    engine.backward(engine(x, step != 1))
+                    if step == 0:
+                        observed_grads = [safe_get_full_grad(p).clone() for p in engine.module.parameters()]
+                    engine.step()
+                params = [safe_get_full_fp32_param(p).clone() for p in engine.module.parameters()]
+                return params, observed_grads
+            finally:
+                engine.destroy()
+
+        expected = run(False)
+        actual = run(True)
+        for expected_group, actual_group in zip(expected, actual):
+            for expected_tensor, actual_tensor in zip(expected_group, actual_group):
+                assert torch.equal(actual_tensor, expected_tensor)
+
+
+class TestZero3LowPrecisionOverflow(DistributedTest):
+    world_size = [1, 2]
+
+    def test_overflow_skips_and_recovers(self):
+        from deepspeed.ops.op_builder import CPUAdamBuilder
+
+        if get_accelerator().is_synchronized_device() or not CPUAdamBuilder().load().adam_fused_supported():
+            pytest.skip('asynchronous accelerator and AVX-512 CPUAdam build required')
+        torch.manual_seed(1234)
+        initial_model = SimpleModel(hidden_dim=16, nlayers=2)
+        inputs = [
+            torch.randn(2, 16, device=get_accelerator().current_device_name(), dtype=torch.float16) for _ in range(3)
+        ]
+        labels = [torch.randint(0, 16, (2, ), device=get_accelerator().current_device_name()) for _ in range(3)]
+
+        def run(enabled):
+            model = deepcopy(initial_model)
+            config = {
+                'train_micro_batch_size_per_gpu': 2,
+                'fp16': {
+                    'enabled': True,
+                    'loss_scale': 0,
+                    'initial_scale_power': 8,
+                    'hysteresis': 1
+                },
+                'gradient_clipping': 0.01,
+                'optimizer': {
+                    'type': 'AdamW',
+                    'params': {
+                        'lr': 0.001
+                    }
+                },
+                'zero_optimization': {
+                    'stage': 3,
+                    'offload_optimizer': {
+                        'device': 'cpu',
+                        'pin_memory': True
+                    },
+                    'low_precision_gradient_offload': enabled,
+                },
+            }
+            engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            try:
+                snapshots = []
+                for index, (x, y) in enumerate(zip(inputs, labels)):
+                    loss = engine(x, y)
+                    if index == 1 and dist.get_rank() == 0:
+                        loss = loss * float('inf')
+                    engine.backward(loss)
+                    engine.step()
+                    params = [safe_get_full_fp32_param(p).clone() for p in engine.module.parameters()]
+                    momentum = [
+                        safe_get_full_optimizer_state(p, 'exp_avg').clone() for p in engine.module.parameters()
+                    ]
+                    snapshots.append((params, momentum, engine.skipped_steps, engine.optimizer.loss_scale))
+                assert snapshots[1][2] == 1
+                assert snapshots[1][3] < snapshots[0][3]
+                return snapshots
+            finally:
+                engine.destroy()
+
+        expected = run(False)
+        actual = run(True)
+        for expected_step, actual_step in zip(expected, actual):
+            assert expected_step[2:] == actual_step[2:]
+            for expected_group, actual_group in zip(expected_step[:2], actual_step[:2]):
+                for expected_tensor, actual_tensor in zip(expected_group, actual_group):
+                    assert torch.equal(actual_tensor, expected_tensor)
+
+
+@pytest.mark.parametrize('precision', ['bf16', 'fp16'])
+class TestZero3CombinedCPUGradientOptions(DistributedTest):
+    world_size = [1, 2]
+
+    def test_matches_zero3(self, precision):
+        from deepspeed.ops.op_builder import CPUAdamBuilder
+
+        if get_accelerator().is_synchronized_device() or not CPUAdamBuilder().load().adam_fused_supported():
+            pytest.skip('asynchronous accelerator and AVX-512 CPUAdam build required')
+        torch.manual_seed(1234)
+        initial_model = SimpleModel(hidden_dim=16, nlayers=2)
+        dtype = torch.bfloat16 if precision == 'bf16' else torch.float16
+        inputs = [torch.randn(2, 16, device=get_accelerator().current_device_name(), dtype=dtype) for _ in range(8)]
+        labels = [torch.randint(0, 16, (2, ), device=get_accelerator().current_device_name()) for _ in range(8)]
+
+        def run(enabled):
+            model = deepcopy(initial_model)
+            config = {
+                'train_micro_batch_size_per_gpu': 2,
+                'gradient_accumulation_steps': 4,
+                'gradient_clipping': 0.01,
+                precision: {
+                    'enabled': True
+                },
+                'optimizer': {
+                    'type': 'AdamW',
+                    'params': {
+                        'lr': 0.001
+                    }
+                },
+                'zero_optimization': {
+                    'stage': 3,
+                    'reduce_bucket_size': 1024,
+                    'stage3_prefetch_bucket_size': 1024,
+                    'offload_optimizer': {
+                        'device': 'cpu',
+                        'pin_memory': True
+                    },
+                    'low_precision_gradient_offload': enabled,
+                    f'cpu_{precision}_gradient_accumulation': enabled,
+                },
+            }
+            if precision == 'fp16':
+                config['fp16']['loss_scale'] = 128
+            engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            engine.optimizer._fused_bf16_copy_piece_numel = 128
+            try:
+                for x, y in zip(inputs, labels):
+                    engine.backward(engine(x, y))
+                    engine.step()
+                params = [safe_get_full_fp32_param(p).clone() for p in engine.module.parameters()]
+                momentum = [safe_get_full_optimizer_state(p, 'exp_avg').clone() for p in engine.module.parameters()]
+                return params, momentum
+            finally:
+                engine.destroy()
+
+        expected = run(False)
+        actual = run(True)
+        for expected_group, actual_group in zip(expected, actual):
+            for expected_tensor, actual_tensor in zip(expected_group, actual_group):
+                assert torch.equal(actual_tensor, expected_tensor)
+
+
+@pytest.mark.parametrize(
+    'option', ['low_precision_gradient_offload', 'cpu_bf16_gradient_accumulation', 'cpu_fp16_gradient_accumulation'])
+def test_cpu_gradient_options_require_zero3(option):
+    from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
+
+    assert not getattr(DeepSpeedZeroConfig(stage=3), option)
+    with pytest.raises(ValueError, match='ZeRO stage 3'):
+        DeepSpeedZeroConfig(stage=2, **{option: True})
+
+
+def test_cpu_gradient_accumulation_precisions_are_exclusive():
+    from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
+
+    with pytest.raises(ValueError, match='Only one CPU gradient accumulation precision'):
+        DeepSpeedZeroConfig(stage=3, cpu_bf16_gradient_accumulation=True, cpu_fp16_gradient_accumulation=True)
+
+
+@pytest.mark.parametrize('lowp_offload', [False, True])
+class TestZero3CPUFP16AccumulationOverflow(DistributedTest):
+    world_size = [1, 2]
+
+    def test_intermediate_overflow_and_recovery(self, lowp_offload):
+        from deepspeed.ops.op_builder import CPUAdamBuilder
+
+        if get_accelerator().is_synchronized_device() or not CPUAdamBuilder().load().adam_fused_supported():
+            pytest.skip('asynchronous accelerator and AVX-512 CPUAdam build required')
+        torch.manual_seed(1234)
+        initial_model = SimpleModel(hidden_dim=16, nlayers=2)
+        device = get_accelerator().current_device_name()
+        inputs = [torch.randn(2, 16, device=device, dtype=torch.float16) for _ in range(12)]
+        labels = [torch.randint(0, 16, (2, ), device=device) for _ in range(12)]
+
+        def run(enabled):
+            model = deepcopy(initial_model)
+            config = {
+                'train_micro_batch_size_per_gpu': 2,
+                'gradient_accumulation_steps': 4,
+                'fp16': {
+                    'enabled': True,
+                    'loss_scale': 0,
+                    'initial_scale_power': 8,
+                    'hysteresis': 1
+                },
+                'optimizer': {
+                    'type': 'AdamW',
+                    'params': {
+                        'lr': 0.001
+                    }
+                },
+                'zero_optimization': {
+                    'stage': 3,
+                    'offload_optimizer': {
+                        'device': 'cpu',
+                        'pin_memory': True
+                    },
+                    'cpu_fp16_gradient_accumulation': enabled,
+                    'low_precision_gradient_offload': enabled and lowp_offload,
+                },
+            }
+            engine, optimizer, _, _ = deepspeed.initialize(model=model,
+                                                           model_parameters=model.parameters(),
+                                                           config=config)
+            try:
+                snapshots = []
+                for step, (x, y) in enumerate(zip(inputs, labels)):
+                    loss = engine(x, y)
+                    if step == 5 and dist.get_rank() == 0:
+                        loss = loss * float('inf')
+                    engine.backward(loss)
+                    boundary = engine.is_gradient_accumulation_boundary()
+                    engine.step()
+                    if boundary:
+                        params = [safe_get_full_fp32_param(p).clone() for p in engine.module.parameters()]
+                        momentum = [
+                            safe_get_full_optimizer_state(p, 'exp_avg').clone() for p in engine.module.parameters()
+                        ]
+                        steps = [int(state['step']) for state in optimizer.optimizer.state.values()]
+                        snapshots.append((params, momentum, steps, engine.skipped_steps, optimizer.loss_scale))
+                assert snapshots[1][3] == 1
+                assert snapshots[1][4] < snapshots[0][4]
+                assert snapshots[1][2] == snapshots[0][2]
+                return snapshots
+            finally:
+                engine.destroy()
+
+        expected = run(False)
+        actual = run(True)
+        for expected_step, actual_step in zip(expected, actual):
+            assert expected_step[2:] == actual_step[2:]
+            for expected_group, actual_group in zip(expected_step[:2], actual_step[:2]):
+                for expected_tensor, actual_tensor in zip(expected_group, actual_group):
+                    assert torch.equal(actual_tensor, expected_tensor)
+
+
+@pytest.mark.parametrize('param_offload', [False, True])
+@pytest.mark.parametrize('low_precision_grad', [False, True])
+class TestZero3FusedCPUAdamOutputReuse(DistributedTest):
+    world_size = [1, 2]
+
+    def test_existing_parameter_buffer_is_reused(self, param_offload, low_precision_grad):
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+        from deepspeed.ops.op_builder import CPUAdamBuilder
+
+        if get_accelerator().is_synchronized_device() or not CPUAdamBuilder().load().adam_fused_supported():
+            pytest.skip('asynchronous accelerator and AVX-512 CPUAdam build required')
+        torch.manual_seed(1234)
+        model = SimpleModel(hidden_dim=16, nlayers=2)
+        optimizer = DeepSpeedCPUAdam(model.parameters(), lr=0.001)
+        config = {
+            'train_micro_batch_size_per_gpu': 2,
+            'bf16': {
+                'enabled': True
+            },
+            'gradient_clipping': 0.01,
+            'zero_optimization': {
+                'stage': 3,
+                'reduce_bucket_size': 1024,
+                'stage3_prefetch_bucket_size': 1024,
+                'sub_group_size': 10000,
+                'offload_optimizer': {
+                    'device': 'cpu',
+                    'pin_memory': True
+                },
+                'low_precision_gradient_offload': low_precision_grad,
+            },
+        }
+        if param_offload:
+            config['zero_optimization']['offload_param'] = {'device': 'cpu', 'pin_memory': True}
+        engine, _, _, _ = deepspeed.initialize(model=model,
+                                               model_parameters=model.parameters(),
+                                               optimizer=optimizer,
+                                               config=config)
+        engine.optimizer._fused_bf16_copy_piece_numel = 128
+        output_ptrs = []
+        step_calls = []
+
+        def check_output(opt, args, kwargs):
+            step_calls.append(1)
+            if param_offload:
+                output = kwargs.get('bf16_output')
+                assert output is not None and output.data_ptr() in {
+                    p.data_ptr()
+                    for p in engine.optimizer.fp16_partitioned_groups_flat
+                }
+                output_ptrs.append(output.data_ptr())
+            else:
+                piece_numel, before, after, buffers = kwargs['bf16_chunks']
+
+                def check_piece(offset, count):
+                    output = before(offset, count)
+                    assert output.data_ptr() in {p.data_ptr() for p in engine.optimizer._fused_bf16_copy_buffers}
+                    output_ptrs.append(output.data_ptr())
+                    return output
+
+                kwargs['bf16_chunks'] = (piece_numel, check_piece, after, buffers)
+                return args, kwargs
+
+        hook = optimizer.register_step_pre_hook(check_output)
+        try:
+            for _ in range(3):
+                x = torch.randn(2, 16, device=engine.device, dtype=torch.bfloat16)
+                y = torch.randint(0, 16, (2, ), device=engine.device)
+                engine.backward(engine(x, y))
+                engine.step()
+            subgroup_count = len(engine.optimizer.fp16_partitioned_groups_flat)
+            assert len(step_calls) == 3 * subgroup_count
+            assert output_ptrs
+            if not param_offload:
+                assert len(set(output_ptrs)) == 2
+                assert len(output_ptrs) > len(step_calls)
+        finally:
+            hook.remove()
+            engine.destroy()

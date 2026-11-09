@@ -52,7 +52,8 @@ void Adam_Optimizer::Step_1(ds_params_precision_t* _params,
 #if defined(__AVX512__)
         size_t fused_offset = 0;
         if constexpr (std::is_same_v<ds_params_precision_t, float>) {
-            if (_bf16_output != nullptr) fused_offset = _params - _fused_base;
+            if (_bf16_output != nullptr || _low_precision_gradient != nullptr)
+                fused_offset = _params - _fused_base;
         }
 #endif
         float betta1_minus1 = 1 - _betta1;
@@ -69,7 +70,16 @@ void Adam_Optimizer::Step_1(ds_params_precision_t* _params,
             for (size_t k = t; k < offset; k++) {
                 float grad = (float)grads[k];
 #if defined(__AVX512__)
-                if (_bf16_output != nullptr) {
+                if (_low_precision_gradient != nullptr) {
+                    size_t index = fused_offset + k;
+                    if (_low_precision_is_bf16) {
+                        grad = float(
+                            static_cast<const c10::BFloat16*>(_low_precision_gradient)[index]);
+                    } else {
+                        grad = float(static_cast<const c10::Half*>(_low_precision_gradient)[index]);
+                    }
+                }
+                if (_bf16_output != nullptr || _low_precision_gradient != nullptr) {
                     grad *= _grad_scale;
                     grads[k] = grad;
                 }
@@ -396,8 +406,15 @@ int ds_adam_step_fused_chunked(int optimizer_id,
                 "invalid fused CPU Adam tensor sizes");
     TORCH_CHECK(!output0.is_alias_of(output1),
                 "fused CPU Adam output buffers must not share storage");
-    TORCH_CHECK(lowp_grad_object.is_none(),
-                "low-precision gradients require the gradient offload path");
+    torch::Tensor lowp_grad;
+    if (!lowp_grad_object.is_none()) {
+        lowp_grad = lowp_grad_object.cast<torch::Tensor>();
+        TORCH_CHECK(lowp_grad.device().is_cpu() && lowp_grad.is_contiguous() &&
+                        (lowp_grad.scalar_type() == torch::kBFloat16 ||
+                         lowp_grad.scalar_type() == torch::kFloat16) &&
+                        lowp_grad.numel() == params.numel(),
+                    "invalid low-precision gradient");
+    }
     auto opt = std::static_pointer_cast<Adam_Optimizer>(s_optimizers.at(optimizer_id));
     opt->IncrementStep(step, beta1, beta2);
     opt->update_state(lr, epsilon, weight_decay, bias_correction);
@@ -413,6 +430,12 @@ int ds_adam_step_fused_chunked(int optimizer_id,
             before_piece(start, count);
             auto& output = outputs[piece % 2];
             opt->set_fused_output(grad_scale, output.data_ptr<c10::BFloat16>(), param_ptr + start);
+            if (lowp_grad.defined()) {
+                auto* source = static_cast<const char*>(lowp_grad.data_ptr()) +
+                               start * lowp_grad.element_size();
+                opt->set_low_precision_gradient(source,
+                                                lowp_grad.scalar_type() == torch::kBFloat16);
+            }
             opt->Step_8<float, float>(param_ptr + start,
                                       grad_ptr + start,
                                       avg_ptr + start,
@@ -422,9 +445,11 @@ int ds_adam_step_fused_chunked(int optimizer_id,
             after_piece(start, count, output.narrow(0, 0, count));
         }
     } catch (...) {
+        opt->set_low_precision_gradient(nullptr, false);
         opt->set_fused_output(1.0f, nullptr);
         throw;
     }
+    opt->set_low_precision_gradient(nullptr, false);
     opt->set_fused_output(1.0f, nullptr);
     return 0;
 }
@@ -475,6 +500,68 @@ int ds_adam_step_fused(int optimizer_id,
         opt->set_fused_output(1.0f, nullptr);
         throw;
     }
+    opt->set_fused_output(1.0f, nullptr);
+    return 0;
+}
+
+int ds_adam_step_low_precision(int optimizer_id,
+                               size_t step,
+                               float lr,
+                               float beta1,
+                               float beta2,
+                               float epsilon,
+                               float weight_decay,
+                               bool bias_correction,
+                               torch::Tensor& params,
+                               torch::Tensor& grads,
+                               torch::Tensor& exp_avg,
+                               torch::Tensor& exp_avg_sq,
+                               float grad_scale,
+                               torch::Tensor& lowp_grad,
+                               torch::Tensor& bf16_output)
+{
+    TORCH_CHECK(ds_adam_fused_supported(), "low-precision CPU Adam requires AVX-512");
+    TORCH_CHECK(lowp_grad.device().is_cpu() && lowp_grad.is_contiguous() &&
+                    (lowp_grad.scalar_type() == torch::kBFloat16 ||
+                     lowp_grad.scalar_type() == torch::kFloat16) &&
+                    lowp_grad.numel() == params.numel(),
+                "invalid low-precision gradient");
+    TORCH_CHECK(params.device().is_cpu() && grads.device().is_cpu() && exp_avg.device().is_cpu() &&
+                    exp_avg_sq.device().is_cpu() && bf16_output.device().is_cpu(),
+                "CPU tensors required");
+    TORCH_CHECK(params.scalar_type() == torch::kFloat32 && grads.scalar_type() == torch::kFloat32 &&
+                    exp_avg.scalar_type() == torch::kFloat32 &&
+                    exp_avg_sq.scalar_type() == torch::kFloat32 &&
+                    bf16_output.scalar_type() == torch::kBFloat16,
+                "unsupported CPU Adam dtype");
+    TORCH_CHECK(params.is_contiguous() && grads.is_contiguous() && exp_avg.is_contiguous() &&
+                    exp_avg_sq.is_contiguous() && bf16_output.is_contiguous(),
+                "contiguous tensors required");
+    TORCH_CHECK(params.numel() == grads.numel() && params.numel() == exp_avg.numel() &&
+                    params.numel() == exp_avg_sq.numel() &&
+                    (bf16_output.numel() == 0 || params.numel() == bf16_output.numel()),
+                "CPU Adam tensor sizes must match");
+    auto opt = std::static_pointer_cast<Adam_Optimizer>(s_optimizers.at(optimizer_id));
+    opt->IncrementStep(step, beta1, beta2);
+    opt->update_state(lr, epsilon, weight_decay, bias_correction);
+    opt->set_fused_output(grad_scale,
+                          bf16_output.numel() ? bf16_output.data_ptr<c10::BFloat16>() : nullptr,
+                          params.data_ptr<float>());
+    opt->set_low_precision_gradient(lowp_grad.data_ptr(),
+                                    lowp_grad.scalar_type() == torch::kBFloat16);
+    try {
+        opt->Step_8<float, float>(params.data_ptr<float>(),
+                                  grads.data_ptr<float>(),
+                                  exp_avg.data_ptr<float>(),
+                                  exp_avg_sq.data_ptr<float>(),
+                                  params.numel(),
+                                  true);
+    } catch (...) {
+        opt->set_low_precision_gradient(nullptr, false);
+        opt->set_fused_output(1.0f, nullptr);
+        throw;
+    }
+    opt->set_low_precision_gradient(nullptr, false);
     opt->set_fused_output(1.0f, nullptr);
     return 0;
 }

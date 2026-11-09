@@ -121,7 +121,7 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
             group.setdefault('amsgrad', False)
 
     @torch.no_grad()
-    def step(self, closure=None, grad_scale=None, bf16_output=None, bf16_chunks=None):
+    def step(self, closure=None, grad_scale=None, bf16_output=None, low_precision_grad=None, bf16_chunks=None):
         """Update the model parameters.
 
         .. note::
@@ -136,13 +136,16 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
             grad_scale (float, optional): Multiplier applied to the gradient in the fused CPU path.
             bf16_output (Tensor, optional): CPU buffer receiving the updated BF16 parameters.
                 Requires one FP32 parameter and an AVX-512 CPUAdam build.
+            low_precision_grad (Tensor, optional): CPU FP16/BF16 gradient used by the fused path.
+                The FP32 gradient buffer receives the scaled gradient for gradient APIs.
+            bf16_chunks (tuple, optional): Piece size and callbacks for reusing BF16 copy buffers.
 
         Returns:
             loss: if ``closure`` is provided. Otherwise ``None``.
         """
 
         if (grad_scale is None) != (bf16_output is None and bf16_chunks is None):
-            raise ValueError("grad_scale and bf16_output must be supplied together")
+            raise ValueError("grad_scale and BF16 output must be supplied together")
         if bf16_output is not None or bf16_chunks is not None:
             active_params = [p for group in self.param_groups for p in group['params'] if p.grad is not None]
             if len(active_params) != 1 or not self.fused_adam_available:
@@ -193,9 +196,15 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
                     self.ds_opt_adam.adam_update_fused_chunked(self.opt_id, state['step'], group['lr'], beta1, beta2,
                                                                group['eps'], group['weight_decay'],
                                                                group['bias_correction'], p.data, p.grad.data,
-                                                               state['exp_avg'], state['exp_avg_sq'], grad_scale, None,
-                                                               buffers[0], buffers[1], piece_numel, before_piece,
-                                                               after_piece)
+                                                               state['exp_avg'], state['exp_avg_sq'], grad_scale,
+                                                               low_precision_grad, buffers[0], buffers[1], piece_numel,
+                                                               before_piece, after_piece)
+                elif low_precision_grad is not None:
+                    self.ds_opt_adam.adam_update_low_precision(self.opt_id, state['step'], group['lr'], beta1, beta2,
+                                                               group['eps'], group['weight_decay'],
+                                                               group['bias_correction'], p.data, p.grad.data,
+                                                               state['exp_avg'], state['exp_avg_sq'], grad_scale,
+                                                               low_precision_grad, bf16_output)
                 elif bf16_output is not None:
                     self.ds_opt_adam.adam_update_fused(self.opt_id, state['step'], group['lr'], beta1, beta2,
                                                        group['eps'], group['weight_decay'], group['bias_correction'],
