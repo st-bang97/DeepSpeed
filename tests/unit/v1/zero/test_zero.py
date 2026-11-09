@@ -2272,3 +2272,56 @@ class TestZero3ClientModuleID(DistributedTest):
         post_init_m_id = model.id
         assert pre_init_m_id == post_init_m_id
         model.destroy()
+
+
+@pytest.mark.parametrize('clip', [0.0, 0.01])
+class TestZero3FusedCPUAdam(DistributedTest):
+    world_size = [1, 2]
+
+    def test_matches_torch_adamw(self, clip):
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+        from deepspeed.ops.op_builder import CPUAdamBuilder
+
+        if not CPUAdamBuilder().load().adam_fused_supported():
+            pytest.skip('AVX-512 CPUAdam build required')
+        torch.manual_seed(1234)
+        initial_model = SimpleModel(hidden_dim=16, nlayers=2)
+        device = get_accelerator().current_device_name()
+        inputs = [torch.randn(2, 16, device=device, dtype=torch.bfloat16) for _ in range(3)]
+        labels = [torch.randint(0, 16, (2, ), device=device) for _ in range(3)]
+        config = {
+            'train_micro_batch_size_per_gpu': 2,
+            'bf16': {
+                'enabled': True
+            },
+            'gradient_clipping': clip,
+            'zero_allow_untested_optimizer': True,
+            'zero_force_ds_cpu_optimizer': False,
+            'zero_optimization': {
+                'stage': 3,
+                'reduce_bucket_size': 1024,
+                'stage3_prefetch_bucket_size': 1024,
+                'offload_optimizer': {
+                    'device': 'cpu'
+                }
+            },
+        }
+
+        def run(optimizer_type):
+            model = deepcopy(initial_model)
+            optimizer = optimizer_type(model.parameters(), lr=0.001, weight_decay=0.01)
+            engine, _, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, config=config)
+            engine.optimizer._fused_bf16_copy_piece_numel = 128
+            try:
+                for x, y in zip(inputs, labels):
+                    loss = engine(x, y)
+                    engine.backward(loss)
+                    engine.step()
+                return [safe_get_full_fp32_param(p).clone() for p in engine.module.parameters()]
+            finally:
+                engine.destroy()
+
+        expected = run(torch.optim.AdamW)
+        actual = run(DeepSpeedCPUAdam)
+        for expected_param, actual_param in zip(expected, actual):
+            torch.testing.assert_close(actual_param, expected_param, rtol=1e-5, atol=2e-6)

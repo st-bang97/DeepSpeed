@@ -622,3 +622,64 @@ class TestCPUAdamSubgroup(DistributedTest):
             assert torch.equal(param_a.data, param_b.data)
             assert torch.equal(optimizer.state[param_a]['exp_avg'], optimizer.state[param_b]['exp_avg'])
             assert torch.equal(optimizer.state[param_a]['exp_avg_sq'], optimizer.state[param_b]['exp_avg_sq'])
+
+
+@pytest.mark.parametrize('model_size', [3, 16, 17, 128, 129])
+@pytest.mark.parametrize('adamw_mode', [True, False])
+def test_cpu_adam_fused_scale_and_bf16_output(model_size, adamw_mode):
+    torch.manual_seed(1234 + model_size)
+    initial = torch.randn(model_size)
+    reference = torch.nn.Parameter(initial.clone())
+    actual = torch.nn.Parameter(initial.clone())
+    reference_optimizer = DeepSpeedCPUAdam([reference], lr=0.001, weight_decay=0.01, adamw_mode=adamw_mode)
+    actual_optimizer = DeepSpeedCPUAdam([actual], lr=0.001, weight_decay=0.01, adamw_mode=adamw_mode)
+    native = actual_optimizer.ds_opt_adam
+    if not native.adam_fused_supported():
+        pytest.skip('AVX-512 CPUAdam build required')
+    expected_state = reference_optimizer.state[reference]
+    actual_state = actual_optimizer.state[actual]
+    for state in (expected_state, actual_state):
+        state['exp_avg'] = torch.zeros_like(initial)
+        state['exp_avg_sq'] = torch.zeros_like(initial)
+        state['step'] = 0
+    for step in range(1, 4):
+        gradient = torch.randn(model_size)
+        scale = 0.125
+        reference.grad = gradient * scale
+        reference_optimizer.step()
+        output = torch.empty(model_size, dtype=torch.bfloat16)
+        native.adam_update_fused(actual_optimizer.opt_id, step, 0.001, 0.9, 0.999, 1e-8, 0.01, True, actual.data,
+                                 gradient, actual_state['exp_avg'], actual_state['exp_avg_sq'], scale, output)
+        assert torch.equal(actual, reference)
+        assert torch.equal(output, reference.to(torch.bfloat16))
+        assert torch.equal(actual_state['exp_avg'], expected_state['exp_avg'])
+        assert torch.equal(actual_state['exp_avg_sq'], expected_state['exp_avg_sq'])
+
+
+def test_cpu_adam_fused_rejects_invalid_output():
+    param = torch.nn.Parameter(torch.ones(16))
+    optimizer = DeepSpeedCPUAdam([param])
+    if not optimizer.fused_adam_available:
+        pytest.skip('AVX-512 CPUAdam build required')
+    grad = torch.ones_like(param)
+    moment = torch.zeros_like(param)
+    for output in (torch.empty(16), torch.empty(15, dtype=torch.bfloat16)):
+        with pytest.raises(RuntimeError):
+            optimizer.ds_opt_adam.adam_update_fused(optimizer.opt_id, 1, 0.001, 0.9, 0.999, 1e-8, 0.0, True,
+                                                    param.data, grad, moment, moment.clone(), 1.0, output)
+
+
+def test_cpu_adam_chunked_rejects_aliased_buffers():
+    param = torch.nn.Parameter(torch.ones(129))
+    optimizer = DeepSpeedCPUAdam([param])
+    if not optimizer.fused_adam_available:
+        pytest.skip('AVX-512 CPUAdam build required')
+    grad = torch.ones_like(param)
+    moment = torch.zeros_like(param)
+    output = torch.empty(128, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        optimizer.ds_opt_adam.adam_update_fused_chunked(optimizer.opt_id, 1, 0.001,
+                                                        0.9, 0.999, 1e-8, 0.0, True, param.data, grad, moment,
+                                                        moment.clone(), 1.0, None, output, output, 128,
+                                                        lambda *args: None, lambda *args: None)
+    assert torch.equal(param, torch.ones_like(param))

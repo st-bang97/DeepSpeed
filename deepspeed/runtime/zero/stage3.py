@@ -497,6 +497,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         print_rank_0(f'Largest partitioned param numel = {largest_partitioned_param_numel}', force=False)
 
         self._setup_for_real_optimizer()
+        self._fused_cpu_adam_configured = (self.offload_optimizer and type(self.optimizer) is DeepSpeedCPUAdam
+                                           and not self.swap_optimizer and not self.zenflow and not self.use_muon
+                                           and not self.torch_autocast_gradscaler
+                                           and self.optimizer.fp32_optimizer_states
+                                           and self.optimizer.fused_adam_available)
         self.grad_position = {}
         self.set_grad_positions()
 
@@ -561,6 +566,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             buffer = getattr(self, attr, None)
             if buffer is not None:
                 accelerator.unpin_memory(buffer)
+        for buffer in getattr(self, '_fused_bf16_copy_buffers', []):
+            accelerator.unpin_memory(buffer)
         for buffer in getattr(self, 'hp_params_pin_buffers', []):
             accelerator.unpin_memory(buffer)
         unpin_offloaded_optimizer_states(self.optimizer)
@@ -801,6 +808,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             self.__param_id_to_grad_partition[param.ds_id] = self.grad_partitions_flat_buffer.narrow(
                 0, offset, param.partition_numel())
             offset += param.partition_numel()
+
+        self._fused_bf16_copy_buffers = []
+        self._fused_bf16_copy_piece_numel = 1024 * 1024
 
         pinned_memory_summary("ZeRO-3 optimizer init")
 
@@ -1243,7 +1253,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         return sub_groups
 
-    def _optimizer_step(self, sub_group_id):
+    def _optimizer_step(self, sub_group_id, grad_scale=None, bf16_output=None, bf16_chunks=None):
         param_group_id = self.sub_group_to_group_id[sub_group_id]
         fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
 
@@ -1252,7 +1262,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 self.torch_autocast_gradscaler.step(optimizer)
                 self.torch_autocast_gradscaler.update()
             else:
-                if not self.zenflow:
+                if bf16_output is not None or bf16_chunks is not None:
+                    optimizer.step(grad_scale=grad_scale, bf16_output=bf16_output, bf16_chunks=bf16_chunks)
+                elif not self.zenflow:
                     optimizer.step()
                 else:
                     self.zenflow_cpu_optimizer_step()
@@ -2886,14 +2898,53 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         event.record()
         event.synchronize()
 
+    def _fused_cpu_adam_copy_chunks(self, sub_group_id, grad_scale):
+        dst = self.fp16_partitioned_groups_flat[sub_group_id].data.view(-1)
+        piece_numel = max(128, self._fused_bf16_copy_piece_numel // 128 * 128)
+        if not self._fused_bf16_copy_buffers:
+            buffer_size = min(piece_numel, max(self.fp16_partitioned_groups_flat_numel))
+            self._fused_bf16_copy_buffers = [
+                get_accelerator().pin_memory(torch.empty(buffer_size, dtype=torch.bfloat16)) for _ in range(2)
+            ]
+        buffers = self._fused_bf16_copy_buffers
+        events = [None, None]
+        piece_index = 0
+
+        def before_piece(start, count):
+            event = events[piece_index % 2]
+            if event is not None:
+                event.synchronize()
+            return buffers[piece_index % 2].narrow(0, 0, count)
+
+        def after_piece(start, count, output):
+            nonlocal piece_index
+            dst.narrow(0, start, count).copy_(output, non_blocking=True)
+            event = get_accelerator().Event()
+            event.record()
+            events[piece_index % 2] = event
+            piece_index += 1
+
+        try:
+            self._optimizer_step(sub_group_id,
+                                 grad_scale=grad_scale,
+                                 bf16_chunks=(piece_numel, before_piece, after_piece, buffers))
+        finally:
+            # The next forward can all-gather on a different stream.
+            if piece_index:
+                events[(piece_index - 1) % 2].synchronize()
+        self._unflatten_partitioned_parameters(sub_group_id)
+
     @instrument_w_nvtx
-    def _reassign_or_swap_out_partitioned_parameters(self, sub_group_id):
+    def _reassign_or_swap_out_partitioned_parameters(self, sub_group_id, bf16_output=None):
         if self.fp16_partitioned_groups_flat[sub_group_id] is not None:
             # When torch autocast is enabled, groups in fp16_partitioned_groups are in fp32 already and those in
             # fp32_partitioned_groups are aliases. Calling tensor.data.copy_ will not trigger any copy in that case.
             dst = self.fp16_partitioned_groups_flat[sub_group_id].data
             src = self.fp32_partitioned_groups_flat[sub_group_id].data
-            if self._master_pinned_at_construction(sub_group_id) and dst.device.type != "cpu":
+            if bf16_output is not None:
+                if dst.data_ptr() != bf16_output.data_ptr():
+                    dst.copy_(bf16_output, non_blocking=False)
+            elif self._master_pinned_at_construction(sub_group_id) and dst.device.type != "cpu":
                 self._copy_pinned_master_to_device(dst, src)
             else:
                 dst.copy_(src)
@@ -2954,14 +3005,26 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
             if self._muon_update_lacks_loss_scale(sub_group_id):
                 self.fp32_partitioned_groups_flat[sub_group_id].grad.mul_(self.loss_scale)
 
-            #scale the fp32 gradients
-            self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
-
-            #apply the optimizer step on the sub group and copy fp32 parameters to fp16
-            self._optimizer_step(sub_group_id)
-
-            #put fp16 parameters in appropriate location
-            self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
+            fp32_param = self.fp32_partitioned_groups_flat[sub_group_id]
+            low_precision_param = self.fp16_partitioned_groups_flat[sub_group_id]
+            use_fused_adam = (self._fused_cpu_adam_configured and self.subgroup_to_device[sub_group_id] == 'cpu'
+                              and low_precision_param is not None and low_precision_param.dtype == torch.bfloat16
+                              and (low_precision_param.device.type == 'cpu' or
+                                   (self.offload_optimizer_pin_memory and self.optimizer.fused_adam_chunked_available))
+                              and fp32_param.dtype == torch.float32 and fp32_param.grad is not None
+                              and fp32_param.grad.dtype == torch.float32)
+            if use_fused_adam:
+                combined_scale = self._combined_grad_scale(scaled_global_grad_norm)
+                if low_precision_param.device.type == 'cpu':
+                    bf16_output = low_precision_param.data
+                    self._optimizer_step(sub_group_id, grad_scale=float(1.0 / combined_scale), bf16_output=bf16_output)
+                    self._reassign_or_swap_out_partitioned_parameters(sub_group_id, bf16_output=bf16_output)
+                else:
+                    self._fused_cpu_adam_copy_chunks(sub_group_id, float(1.0 / combined_scale))
+            else:
+                self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
+                self._optimizer_step(sub_group_id)
+                self._reassign_or_swap_out_partitioned_parameters(sub_group_id)
 
             #release memory or swap out optimizer states of fp32 parameters
             self._release_sub_group(sub_group_id, timer_names)
@@ -3015,16 +3078,18 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                 norm_list = [param_norm, ds_norm] + unflat_norm
                 print(f'Post-Step Norms {i} {param_id} = {norm_list}')
 
-    @instrument_w_nvtx
-    def unscale_and_clip_grads(self, sub_group_id, total_norm):
-        # compute combined scale factor for this group
+    def _combined_grad_scale(self, total_norm):
         combined_scale = self.loss_scale
         if self.clip_grad > 0.:
             # norm is in fact norm*scale
             clip = ((total_norm / self.loss_scale) + 1e-6) / self.clip_grad
             clip = torch.clamp(clip, min=1.0)
             combined_scale = clip * self.loss_scale
+        return combined_scale
 
+    @instrument_w_nvtx
+    def unscale_and_clip_grads(self, sub_group_id, total_norm):
+        combined_scale = self._combined_grad_scale(total_norm)
         self.fp32_partitioned_groups_flat[sub_group_id].grad.mul_(1. / combined_scale)
 
     def _check_overflow(self, partition_gradients=True):

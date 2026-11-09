@@ -49,6 +49,12 @@ void Adam_Optimizer::Step_1(ds_params_precision_t* _params,
     Step_RVV<1>(&rounded_size, _params, grads, _exp_avg, _exp_avg_sq, _param_size, parallel);
 #endif
     if (_param_size > rounded_size) {
+#if defined(__AVX512__)
+        size_t fused_offset = 0;
+        if constexpr (std::is_same_v<ds_params_precision_t, float>) {
+            if (_bf16_output != nullptr) fused_offset = _params - _fused_base;
+        }
+#endif
         float betta1_minus1 = 1 - _betta1;
         float betta2_minus1 = 1 - _betta2;
 
@@ -62,6 +68,12 @@ void Adam_Optimizer::Step_1(ds_params_precision_t* _params,
 #pragma omp parallel for if (parallel)
             for (size_t k = t; k < offset; k++) {
                 float grad = (float)grads[k];
+#if defined(__AVX512__)
+                if (_bf16_output != nullptr) {
+                    grad *= _grad_scale;
+                    grads[k] = grad;
+                }
+#endif
                 float param = (float)_params[k];
                 float momentum = _exp_avg[k];
                 float variance = _exp_avg_sq[k];
@@ -79,6 +91,11 @@ void Adam_Optimizer::Step_1(ds_params_precision_t* _params,
                 if (_weight_decay > 0 && _adamw_mode) { param += w_decay * param; }
                 param = grad * step_size + param;
                 _params[k] = param;
+#if defined(__AVX512__)
+                if (_bf16_output != nullptr) {
+                    _bf16_output[fused_offset + k] = c10::BFloat16(param);
+                }
+#endif
                 _exp_avg[k] = momentum;
                 _exp_avg_sq[k] = variance;
             }
@@ -273,6 +290,140 @@ int ds_adam_step(int optimizer_id,
 
     invoke(opt, params_c, grads_c, exp_avg_c, exp_avg_sq_c, params_c.numel());
 
+    return 0;
+}
+
+bool ds_adam_fused_supported()
+{
+#if defined(__AVX512__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+int ds_adam_step_fused_chunked(int optimizer_id,
+                               size_t step,
+                               float lr,
+                               float beta1,
+                               float beta2,
+                               float epsilon,
+                               float weight_decay,
+                               bool bias_correction,
+                               torch::Tensor params,
+                               torch::Tensor grads,
+                               torch::Tensor exp_avg,
+                               torch::Tensor exp_avg_sq,
+                               float grad_scale,
+                               pybind11::object lowp_grad_object,
+                               torch::Tensor output0,
+                               torch::Tensor output1,
+                               size_t piece_numel,
+                               pybind11::function before_piece,
+                               pybind11::function after_piece)
+{
+    TORCH_CHECK(ds_adam_fused_supported(), "fused CPU Adam requires AVX-512");
+    TORCH_CHECK(params.device().is_cpu() && grads.device().is_cpu() && exp_avg.device().is_cpu() &&
+                    exp_avg_sq.device().is_cpu() && output0.device().is_cpu() &&
+                    output1.device().is_cpu(),
+                "CPU tensors required");
+    TORCH_CHECK(params.scalar_type() == torch::kFloat32 && grads.scalar_type() == torch::kFloat32 &&
+                    exp_avg.scalar_type() == torch::kFloat32 &&
+                    exp_avg_sq.scalar_type() == torch::kFloat32 &&
+                    output0.scalar_type() == torch::kBFloat16 &&
+                    output1.scalar_type() == torch::kBFloat16,
+                "unsupported fused CPU Adam dtype");
+    TORCH_CHECK(params.is_contiguous() && grads.is_contiguous() && exp_avg.is_contiguous() &&
+                    exp_avg_sq.is_contiguous() && output0.is_contiguous() &&
+                    output1.is_contiguous(),
+                "contiguous tensors required");
+    TORCH_CHECK(params.numel() == grads.numel() && params.numel() == exp_avg.numel() &&
+                    params.numel() == exp_avg_sq.numel() && piece_numel > 0 &&
+                    output0.numel() >= std::min(static_cast<size_t>(params.numel()), piece_numel) &&
+                    output1.numel() >= std::min(static_cast<size_t>(params.numel()), piece_numel),
+                "invalid fused CPU Adam tensor sizes");
+    TORCH_CHECK(!output0.is_alias_of(output1),
+                "fused CPU Adam output buffers must not share storage");
+    TORCH_CHECK(lowp_grad_object.is_none(),
+                "low-precision gradients require the gradient offload path");
+    auto opt = std::static_pointer_cast<Adam_Optimizer>(s_optimizers.at(optimizer_id));
+    opt->IncrementStep(step, beta1, beta2);
+    opt->update_state(lr, epsilon, weight_decay, bias_correction);
+    auto* param_ptr = params.data_ptr<float>();
+    auto* grad_ptr = grads.data_ptr<float>();
+    auto* avg_ptr = exp_avg.data_ptr<float>();
+    auto* avg_sq_ptr = exp_avg_sq.data_ptr<float>();
+    torch::Tensor outputs[2] = {output0, output1};
+    const size_t numel = params.numel();
+    try {
+        for (size_t start = 0, piece = 0; start < numel; start += piece_numel, ++piece) {
+            const size_t count = std::min(piece_numel, numel - start);
+            before_piece(start, count);
+            auto& output = outputs[piece % 2];
+            opt->set_fused_output(grad_scale, output.data_ptr<c10::BFloat16>(), param_ptr + start);
+            opt->Step_8<float, float>(param_ptr + start,
+                                      grad_ptr + start,
+                                      avg_ptr + start,
+                                      avg_sq_ptr + start,
+                                      count,
+                                      true);
+            after_piece(start, count, output.narrow(0, 0, count));
+        }
+    } catch (...) {
+        opt->set_fused_output(1.0f, nullptr);
+        throw;
+    }
+    opt->set_fused_output(1.0f, nullptr);
+    return 0;
+}
+
+int ds_adam_step_fused(int optimizer_id,
+                       size_t step,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       float epsilon,
+                       float weight_decay,
+                       bool bias_correction,
+                       torch::Tensor& params,
+                       torch::Tensor& grads,
+                       torch::Tensor& exp_avg,
+                       torch::Tensor& exp_avg_sq,
+                       float grad_scale,
+                       torch::Tensor& bf16_output)
+{
+    TORCH_CHECK(ds_adam_fused_supported(), "fused CPU Adam requires AVX-512");
+    TORCH_CHECK(params.device().is_cpu() && grads.device().is_cpu() && exp_avg.device().is_cpu() &&
+                    exp_avg_sq.device().is_cpu() && bf16_output.device().is_cpu(),
+                "CPU tensors required");
+    TORCH_CHECK(params.scalar_type() == torch::kFloat32 && grads.scalar_type() == torch::kFloat32 &&
+                    exp_avg.scalar_type() == torch::kFloat32 &&
+                    exp_avg_sq.scalar_type() == torch::kFloat32 &&
+                    bf16_output.scalar_type() == torch::kBFloat16,
+                "unsupported fused CPU Adam dtype");
+    TORCH_CHECK(params.is_contiguous() && grads.is_contiguous() && exp_avg.is_contiguous() &&
+                    exp_avg_sq.is_contiguous() && bf16_output.is_contiguous(),
+                "contiguous tensors required");
+    TORCH_CHECK(params.numel() == grads.numel() && params.numel() == exp_avg.numel() &&
+                    params.numel() == exp_avg_sq.numel() && params.numel() == bf16_output.numel(),
+                "fused CPU Adam tensor sizes must match");
+    auto opt = std::static_pointer_cast<Adam_Optimizer>(s_optimizers.at(optimizer_id));
+    opt->IncrementStep(step, beta1, beta2);
+    opt->update_state(lr, epsilon, weight_decay, bias_correction);
+    opt->set_fused_output(
+        grad_scale, bf16_output.data_ptr<c10::BFloat16>(), params.data_ptr<float>());
+    try {
+        opt->Step_8<float, float>(params.data_ptr<float>(),
+                                  grads.data_ptr<float>(),
+                                  exp_avg.data_ptr<float>(),
+                                  exp_avg_sq.data_ptr<float>(),
+                                  params.numel(),
+                                  true);
+    } catch (...) {
+        opt->set_fused_output(1.0f, nullptr);
+        throw;
+    }
+    opt->set_fused_output(1.0f, nullptr);
     return 0;
 }
 

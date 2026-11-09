@@ -79,6 +79,12 @@ public:
     STEP(1)
     STEP(4)
     STEP(8)
+    void set_fused_output(float grad_scale, c10::BFloat16* output, float* base = nullptr)
+    {
+        _grad_scale = grad_scale;
+        _bf16_output = output;
+        _fused_base = base;
+    }
     inline void IncrementStep(size_t step, float beta1, float beta2)
     {
         if (beta1 != _betta1 || beta2 != _betta2) {
@@ -117,6 +123,9 @@ public:
     }
 
 private:
+    float* _fused_base = nullptr;
+    float _grad_scale = 1.0f;
+    c10::BFloat16* _bf16_output = nullptr;
     float _alpha;
     float _betta1;
     float _betta2;
@@ -147,6 +156,12 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
     if (std::is_same_v<ds_params_precision_t, c10::BFloat16> ||
         std::is_same_v<ds_state_precision_t, c10::BFloat16>) {
         return;
+    }
+#endif
+#if defined(__AVX512__)
+    size_t fused_offset = 0;
+    if constexpr (std::is_same_v<ds_params_precision_t, float>) {
+        if (_bf16_output != nullptr) fused_offset = _params - _fused_base;
     }
 #endif
     size_t new_rounded_size = 0;
@@ -186,6 +201,14 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
         for (size_t i = t; i < offset; i += SIMD_WIDTH * span) {
             AVX_Data grad_4[span];
             simd_load<span>(grad_4, grads + i);
+#if defined(__AVX512__)
+            if (_bf16_output != nullptr) {
+                AVX_Data scale;
+                scale.data = SIMD_SET(_grad_scale);
+                simd_mul<span>(grad_4, grad_4, scale);
+                simd_store<span>(grads + i, grad_4);
+            }
+#endif
 
             AVX_Data momentum_4[span];
             simd_load<span>(momentum_4, _exp_avg + i);
@@ -216,6 +239,11 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
             simd_fma<span>(param_4, grad_4, step_size_4, param_4);
 
             simd_store<span>(_params + i, param_4);
+#if defined(__AVX512__)
+            if (_bf16_output != nullptr) {
+                simd_store<span>(_bf16_output + fused_offset + i, param_4);
+            }
+#endif
             simd_store<span>(_exp_avg + i, momentum_4);
             simd_store<span>(_exp_avg_sq + i, variance_4);
         }
@@ -307,6 +335,41 @@ int ds_adam_step(int optimizer_id,
                  torch::Tensor& grads,
                  torch::Tensor& exp_avg,
                  torch::Tensor& exp_avg_sq);
+
+bool ds_adam_fused_supported();
+int ds_adam_step_fused_chunked(int optimizer_id,
+                               size_t step,
+                               float lr,
+                               float beta1,
+                               float beta2,
+                               float epsilon,
+                               float weight_decay,
+                               bool bias_correction,
+                               torch::Tensor params,
+                               torch::Tensor grads,
+                               torch::Tensor exp_avg,
+                               torch::Tensor exp_avg_sq,
+                               float grad_scale,
+                               pybind11::object lowp_grad,
+                               torch::Tensor output0,
+                               torch::Tensor output1,
+                               size_t piece_numel,
+                               pybind11::function before_piece,
+                               pybind11::function after_piece);
+int ds_adam_step_fused(int optimizer_id,
+                       size_t step,
+                       float lr,
+                       float beta1,
+                       float beta2,
+                       float epsilon,
+                       float weight_decay,
+                       bool bias_correction,
+                       torch::Tensor& params,
+                       torch::Tensor& grads,
+                       torch::Tensor& exp_avg,
+                       torch::Tensor& exp_avg_sq,
+                       float grad_scale,
+                       torch::Tensor& bf16_output);
 
 int ds_adam_rollback(int optimizer_id,
                      size_t step,

@@ -76,6 +76,8 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
         from cpuinfo import get_cpu_info
         cpu_info = get_cpu_info()
         self.cpu_vendor = cpu_info["vendor_id_raw"].lower() if "vendor_id_raw" in cpu_info else "unknown"
+        cpu_flags = set(cpu_info.get("flags", []))
+        self.supports_fused_bf16 = {"avx512f", "avx512bw", "avx512vl"}.issubset(cpu_flags)
         if "amd" in self.cpu_vendor:
             for group_id, group in enumerate(self.param_groups):
                 for param_id, p in enumerate(group['params']):
@@ -93,6 +95,11 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
             self.ds_opt_adam = CPUAdamBuilder().load()
         except Exception as e:
             raise RuntimeError("DeepSpeedCPUAdam requires the cpu_adam op, which failed to build/load.") from e
+
+        self.fused_adam_available = (self.supports_fused_bf16 and hasattr(self.ds_opt_adam, 'adam_fused_supported')
+                                     and self.ds_opt_adam.adam_fused_supported())
+        self.fused_adam_chunked_available = (self.fused_adam_available
+                                             and hasattr(self.ds_opt_adam, 'adam_update_fused_chunked'))
 
         self.ds_opt_adam.create_adam(self.opt_id, lr, betas[0], betas[1], eps, weight_decay, adamw_mode,
                                      should_log_le("info"))
@@ -114,7 +121,7 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
             group.setdefault('amsgrad', False)
 
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, closure=None, grad_scale=None, bf16_output=None, bf16_chunks=None):
         """Update the model parameters.
 
         .. note::
@@ -126,10 +133,23 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
         Args:
             closure (callable, optional): closure to compute the loss.
                 Defaults to ``None``.
+            grad_scale (float, optional): Multiplier applied to the gradient in the fused CPU path.
+            bf16_output (Tensor, optional): CPU buffer receiving the updated BF16 parameters.
+                Requires one FP32 parameter and an AVX-512 CPUAdam build.
 
         Returns:
             loss: if ``closure`` is provided. Otherwise ``None``.
         """
+
+        if (grad_scale is None) != (bf16_output is None and bf16_chunks is None):
+            raise ValueError("grad_scale and bf16_output must be supplied together")
+        if bf16_output is not None or bf16_chunks is not None:
+            active_params = [p for group in self.param_groups for p in group['params'] if p.grad is not None]
+            if len(active_params) != 1 or not self.fused_adam_available:
+                raise ValueError("fused CPU Adam requires one parameter and AVX-512 support")
+
+        if bf16_chunks is not None and not self.fused_adam_chunked_available:
+            raise ValueError("chunked fused CPU Adam is not supported by this build")
 
         loss = None
         if closure is not None:
@@ -167,9 +187,24 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
                 state['step'] += 1
                 beta1, beta2 = group['betas']
 
-                self.ds_opt_adam.adam_update(self.opt_id, state['step'], group['lr'], beta1, beta2, group['eps'],
-                                             group['weight_decay'], group['bias_correction'], p.data, p.grad.data,
-                                             state['exp_avg'], state['exp_avg_sq'])
+                if bf16_chunks is not None:
+                    piece_numel, before_piece, after_piece, buffers = bf16_chunks
+                    piece_numel = max(128, piece_numel - piece_numel % 128)
+                    self.ds_opt_adam.adam_update_fused_chunked(self.opt_id, state['step'], group['lr'], beta1, beta2,
+                                                               group['eps'], group['weight_decay'],
+                                                               group['bias_correction'], p.data, p.grad.data,
+                                                               state['exp_avg'], state['exp_avg_sq'], grad_scale, None,
+                                                               buffers[0], buffers[1], piece_numel, before_piece,
+                                                               after_piece)
+                elif bf16_output is not None:
+                    self.ds_opt_adam.adam_update_fused(self.opt_id, state['step'], group['lr'], beta1, beta2,
+                                                       group['eps'], group['weight_decay'], group['bias_correction'],
+                                                       p.data, p.grad.data, state['exp_avg'], state['exp_avg_sq'],
+                                                       grad_scale, bf16_output)
+                else:
+                    self.ds_opt_adam.adam_update(self.opt_id, state['step'], group['lr'], beta1, beta2, group['eps'],
+                                                 group['weight_decay'], group['bias_correction'], p.data, p.grad.data,
+                                                 state['exp_avg'], state['exp_avg_sq'])
         return loss
 
     @torch.no_grad()
