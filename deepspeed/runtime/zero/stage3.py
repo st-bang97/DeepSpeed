@@ -201,6 +201,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         cpu_bf16_gradient_accumulation=False,
         cpu_fp16_gradient_accumulation=False,
         low_precision_gradient_offload=False,
+        preserve_fused_optimizer_gradients=False,
         elastic_checkpoint=False,
         aio_config=None,
         all2all_process_group=None,
@@ -299,6 +300,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.persistent_parameters = self.parameter_offload.persistent_parameters
         self._configure_offloading(offload_optimizer_config, offload_param_config)
+        self.preserve_fused_optimizer_gradients = preserve_fused_optimizer_gradients
+        self._pending_fused_gradient_scales = {}
         self.low_precision_gradient_offload = low_precision_gradient_offload
         self._lowp_boundary_ready = set()
         self._lowp_materialized_groups = set()
@@ -308,7 +311,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     or self.gradient_accumulation_dtype != self.dtype or type(self.optimizer) is not DeepSpeedCPUAdam
                     or not self.optimizer.fused_adam_available or self.partial_offload != 1.0 or self.zenflow
                     or not self.optimizer.fp32_optimizer_states
-                    or not hasattr(self.optimizer.ds_opt_adam, 'adam_update_low_precision')
+                    or not hasattr(self.optimizer.ds_opt_adam, 'adam_update_low_precision') or
+                (not self.preserve_fused_optimizer_gradients and not self.optimizer.fused_gradient_writeback_supported)
                     or get_accelerator().is_synchronized_device()):
                 raise ValueError("low_precision_gradient_offload requires FP16/BF16 ZeRO-3, matching "
                                  "gradient accumulation dtype, pinned CPU offload, DeepSpeedCPUAdam, "
@@ -546,7 +550,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                                            and not self.swap_optimizer and not self.zenflow and not self.use_muon
                                            and not self.torch_autocast_gradscaler
                                            and self.optimizer.fp32_optimizer_states
-                                           and self.optimizer.fused_adam_available)
+                                           and self.optimizer.fused_adam_available
+                                           and (self.preserve_fused_optimizer_gradients
+                                                or self.optimizer.fused_gradient_writeback_supported))
         self.grad_position = {}
         self.set_grad_positions()
 
@@ -1328,7 +1334,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                     optimizer.step(grad_scale=grad_scale,
                                    bf16_output=bf16_output,
                                    low_precision_grad=low_precision_grad,
-                                   bf16_chunks=bf16_chunks)
+                                   bf16_chunks=bf16_chunks,
+                                   preserve_gradient=self.preserve_fused_optimizer_gradients)
                 elif not self.zenflow:
                     optimizer.step()
                 else:
@@ -3087,11 +3094,31 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self.custom_loss_scaler = True
         self.external_loss_scale = loss_scale
 
+    def _restore_inactive_fused_gradients(self, sub_group_id, active_param_ids):
+        # ZeRO reuses inactive gradient slices, so apply their deferred scale before the next update.
+        if not self._pending_fused_gradient_scales:
+            return
+        fp32_grad = self.fp32_partitioned_groups_flat[sub_group_id].grad
+        for param in self.fp16_groups[sub_group_id]:
+            pending = self._pending_fused_gradient_scales.pop(param.ds_id, None)
+            if pending is None or param.ds_id in active_param_ids:
+                continue
+            scale, was_low_precision = pending
+            _, offset, numel = self.grad_position[self.get_param_id(param)]
+            grad = fp32_grad.narrow(0, offset, numel)
+            if was_low_precision:
+                grad.copy_(self._lowp_gradient_groups[sub_group_id].narrow(0, offset, numel))
+            if scale != 1.0:
+                grad.mul_(scale)
+
     @instrument_w_nvtx
     def step(self, closure=None):
         """
             Not supporting closure.
         """
+        active_param_ids = self._offload_boundary_param_ids
+        for param_id in active_param_ids:
+            self._pending_fused_gradient_scales.pop(param_id, None)
         if self.low_precision_gradient_offload:
             self._wait_for_cpu_low_precision_accumulation()
             if not get_accelerator().resolves_data_dependency():
@@ -3144,6 +3171,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
             #prepare optimizer states, gradients and fp32 parameters for update
             self._prepare_sub_group(sub_group_id, timer_names)
+            self._restore_inactive_fused_gradients(sub_group_id, active_param_ids)
             if self._muon_update_lacks_loss_scale(sub_group_id):
                 self.fp32_partitioned_groups_flat[sub_group_id].grad.mul_(self.loss_scale)
 
@@ -3177,6 +3205,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
                                          low_precision_grad=lowp_grad)
                     self._reassign_or_swap_out_partitioned_parameters(sub_group_id,
                                                                       bf16_output=output if output.numel() else None)
+                if not self.preserve_fused_optimizer_gradients and (grad_scale != 1.0 or use_low_precision_grad):
+                    for param in group:
+                        self._pending_fused_gradient_scales[param.ds_id] = (grad_scale, use_low_precision_grad)
             else:
                 self.unscale_and_clip_grads(sub_group_id, scaled_global_grad_norm)
                 self._optimizer_step(sub_group_id)

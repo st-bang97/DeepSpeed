@@ -2658,8 +2658,10 @@ class TestZero3CombinedCPUGradientOptions(DistributedTest):
                 assert torch.equal(actual_tensor, expected_tensor)
 
 
-@pytest.mark.parametrize(
-    'option', ['low_precision_gradient_offload', 'cpu_bf16_gradient_accumulation', 'cpu_fp16_gradient_accumulation'])
+@pytest.mark.parametrize('option', [
+    'low_precision_gradient_offload', 'cpu_bf16_gradient_accumulation', 'cpu_fp16_gradient_accumulation',
+    'preserve_fused_optimizer_gradients'
+])
 def test_cpu_gradient_options_require_zero3(option):
     from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
 
@@ -2831,3 +2833,95 @@ class TestZero3FusedCPUAdamOutputReuse(DistributedTest):
         finally:
             hook.remove()
             engine.destroy()
+
+
+@pytest.mark.parametrize('low_precision_grad', [False, True])
+class TestZero3FusedGradientWriteback(DistributedTest):
+    world_size = [1, 2]
+
+    def test_unused_parameter_matches_preserved_gradients(self, low_precision_grad):
+        from deepspeed.ops.op_builder import CPUAdamBuilder
+
+        if ((low_precision_grad and get_accelerator().is_synchronized_device())
+                or not CPUAdamBuilder().load().adam_fused_supported()):
+            pytest.skip('asynchronous accelerator and AVX-512 CPUAdam build required')
+
+        class ConditionalModel(Module):
+
+            def __init__(self):
+                super().__init__()
+                self.first = Linear(16, 16)
+                self.second = Linear(16, 16)
+
+            def forward(self, x, use_second):
+                x = self.first(x)
+                if use_second:
+                    x = self.second(x)
+                return x.float().square().mean()
+
+        torch.manual_seed(1234)
+        initial_model = ConditionalModel()
+        device = get_accelerator().current_device_name()
+        inputs = [torch.randn(2, 16, device=device, dtype=torch.bfloat16) for _ in range(4)]
+
+        def run(preserve):
+            model = deepcopy(initial_model)
+            config = {
+                'train_micro_batch_size_per_gpu': 2,
+                'bf16': {
+                    'enabled': True
+                },
+                'gradient_clipping': 0.01,
+                'optimizer': {
+                    'type': 'AdamW',
+                    'params': {
+                        'lr': 0.001
+                    }
+                },
+                'zero_optimization': {
+                    'stage': 3,
+                    'reduce_bucket_size': 1024,
+                    'stage3_prefetch_bucket_size': 1024,
+                    'offload_optimizer': {
+                        'device': 'cpu',
+                        'pin_memory': True
+                    },
+                    'low_precision_gradient_offload': low_precision_grad,
+                    'preserve_fused_optimizer_gradients': preserve,
+                },
+            }
+            engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+            engine.optimizer._fused_bf16_copy_piece_numel = 128
+            fused_steps = []
+
+            def capture_fused_step(optimizer, args, kwargs):
+                if kwargs.get('grad_scale') is not None:
+                    fused_steps.append(kwargs['preserve_gradient'])
+
+            hook = engine.optimizer.optimizer.register_step_pre_hook(capture_fused_step)
+            try:
+                for index, x in enumerate(inputs):
+                    engine.backward(engine(x, index not in (1, 2)))
+                    first_param = next(engine.module.parameters())
+                    if index == 0:
+                        before_step = safe_get_full_grad(first_param).clone()
+                    engine.step()
+                    if preserve and index == 0:
+                        norm = engine.optimizer._global_grad_norm * engine.optimizer.loss_scale
+                        scale = float(1.0 / engine.optimizer._combined_grad_scale(norm))
+                        after_step = safe_get_full_grad(first_param)
+                        torch.testing.assert_close(after_step, before_step * scale, rtol=1e-6, atol=1e-7)
+                assert fused_steps and all(flag is preserve for flag in fused_steps)
+                params = [safe_get_full_fp32_param(p).clone() for p in engine.module.parameters()]
+                momentum = [safe_get_full_optimizer_state(p, 'exp_avg').clone() for p in engine.module.parameters()]
+                variance = [safe_get_full_optimizer_state(p, 'exp_avg_sq').clone() for p in engine.module.parameters()]
+                return params, momentum, variance, [before_step]
+            finally:
+                hook.remove()
+                engine.destroy()
+
+        expected = run(True)
+        actual = run(False)
+        for expected_group, actual_group in zip(expected, actual):
+            for expected_tensor, actual_tensor in zip(expected_group, actual_group):
+                assert torch.equal(actual_tensor, expected_tensor)

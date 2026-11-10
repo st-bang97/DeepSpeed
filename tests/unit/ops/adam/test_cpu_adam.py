@@ -746,3 +746,67 @@ def test_cpu_adam_chunked_rejects_aliased_buffers():
                                                         moment.clone(), 1.0, None, output, output, 128,
                                                         lambda *args: None, lambda *args: None)
     assert torch.equal(param, torch.ones_like(param))
+
+
+@pytest.mark.parametrize('preserve_gradient', [False, True])
+def test_fused_cpu_adam_gradient_writeback(preserve_gradient):
+    torch.manual_seed(42)
+    initial = torch.randn(129)
+    gradient = torch.randn_like(initial)
+    actual = torch.nn.Parameter(initial.clone())
+    expected = torch.nn.Parameter(initial.clone())
+    actual.grad = gradient.clone()
+    expected.grad = gradient * 0.25
+    actual_optimizer = DeepSpeedCPUAdam([actual], lr=0.001)
+    expected_optimizer = DeepSpeedCPUAdam([expected], lr=0.001)
+    if not actual_optimizer.fused_adam_available:
+        pytest.skip('AVX-512 CPUAdam build required')
+    output = torch.empty_like(actual, dtype=torch.bfloat16)
+    actual_optimizer.step(grad_scale=0.25, bf16_output=output, preserve_gradient=preserve_gradient)
+    expected_optimizer.step()
+    assert torch.equal(actual, expected)
+    assert torch.equal(output, expected.to(torch.bfloat16))
+    assert torch.equal(actual.grad, expected.grad if preserve_gradient else gradient)
+    for name in ('exp_avg', 'exp_avg_sq'):
+        assert torch.equal(actual_optimizer.state[actual][name], expected_optimizer.state[expected][name])
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize('preserve_gradient', [False, True])
+def test_low_precision_fused_gradient_writeback(dtype, preserve_gradient):
+    torch.manual_seed(43)
+    initial = torch.randn(129)
+    lowp_grad = torch.randn(129).to(dtype)
+    actual = torch.nn.Parameter(initial.clone())
+    expected = torch.nn.Parameter(initial.clone())
+    actual.grad = torch.zeros_like(actual)
+    expected.grad = lowp_grad.float() * 0.25
+    actual_optimizer = DeepSpeedCPUAdam([actual], lr=0.001)
+    expected_optimizer = DeepSpeedCPUAdam([expected], lr=0.001)
+    if not actual_optimizer.fused_adam_available:
+        pytest.skip('AVX-512 CPUAdam build required')
+    output = torch.empty_like(actual, dtype=torch.bfloat16)
+    actual_optimizer.step(grad_scale=0.25,
+                          bf16_output=output,
+                          low_precision_grad=lowp_grad,
+                          preserve_gradient=preserve_gradient)
+    expected_optimizer.step()
+    assert torch.equal(actual, expected)
+    assert torch.equal(output, expected.to(torch.bfloat16))
+    assert torch.equal(actual.grad, expected.grad if preserve_gradient else torch.zeros_like(actual.grad))
+    for name in ('exp_avg', 'exp_avg_sq'):
+        assert torch.equal(actual_optimizer.state[actual][name], expected_optimizer.state[expected][name])
+
+
+def test_fused_cpu_adam_gradient_writeback_can_change_between_steps():
+    torch.manual_seed(44)
+    param = torch.nn.Parameter(torch.randn(129))
+    optimizer = DeepSpeedCPUAdam([param], lr=0.001)
+    if not optimizer.fused_adam_available:
+        pytest.skip('AVX-512 CPUAdam build required')
+    output = torch.empty_like(param, dtype=torch.bfloat16)
+    for preserve in (False, False, True, False, True):
+        gradient = torch.randn_like(param)
+        param.grad = gradient.clone()
+        optimizer.step(grad_scale=0.25, bf16_output=output, preserve_gradient=preserve)
+        assert torch.equal(param.grad, gradient * 0.25 if preserve else gradient)

@@ -10,6 +10,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     using namespace pybind11::literals;
     m.def("adam_update", &ds_adam_step, "DeepSpeed CPU Adam update (C++)");
     m.def("adam_fused_supported", &ds_adam_fused_supported);
+    m.def("adam_set_gradient_writeback", &ds_adam_set_gradient_writeback);
     m.def("bf16_accumulate",
           &ds_adam_bf16_accumulate,
           pybind11::call_guard<pybind11::gil_scoped_release>());

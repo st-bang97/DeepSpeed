@@ -2800,6 +2800,7 @@ class DeepSpeedEngine(Module):
                     cpu_bf16_gradient_accumulation=self._config.zero_config.cpu_bf16_gradient_accumulation,
                     cpu_fp16_gradient_accumulation=self._config.zero_config.cpu_fp16_gradient_accumulation,
                     low_precision_gradient_offload=self._config.zero_config.low_precision_gradient_offload,
+                    preserve_fused_optimizer_gradients=self._config.zero_config.preserve_fused_optimizer_gradients,
                     aio_config=self.aio_config(),
                     gradient_accumulation_dtype=gradient_accumulation_dtype,
                     communication_data_type=self.communication_data_type,

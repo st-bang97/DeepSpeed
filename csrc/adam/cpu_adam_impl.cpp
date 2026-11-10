@@ -81,7 +81,7 @@ void Adam_Optimizer::Step_1(ds_params_precision_t* _params,
                 }
                 if (_bf16_output != nullptr || _low_precision_gradient != nullptr) {
                     grad *= _grad_scale;
-                    grads[k] = grad;
+                    if (_write_scaled_gradient) grads[k] = grad;
                 }
 #endif
                 float param = (float)_params[k];
@@ -362,6 +362,12 @@ void ds_adam_fp16_accumulate(torch::Tensor& dst, torch::Tensor& src)
 #if defined(__AVX512__)
     cpu_adam_accumulate_half<c10::Half>(dst, src);
 #endif
+}
+
+void ds_adam_set_gradient_writeback(int optimizer_id, bool enabled)
+{
+    auto opt = std::static_pointer_cast<Adam_Optimizer>(s_optimizers.at(optimizer_id));
+    opt->set_gradient_writeback(enabled);
 }
 
 int ds_adam_step_fused_chunked(int optimizer_id,

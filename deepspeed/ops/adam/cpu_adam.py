@@ -98,6 +98,8 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
 
         self.fused_adam_available = (self.supports_fused_bf16 and hasattr(self.ds_opt_adam, 'adam_fused_supported')
                                      and self.ds_opt_adam.adam_fused_supported())
+        self.fused_gradient_writeback_supported = hasattr(self.ds_opt_adam, 'adam_set_gradient_writeback')
+        self._fused_gradient_writeback_enabled = True
         self.fused_adam_chunked_available = (self.fused_adam_available
                                              and hasattr(self.ds_opt_adam, 'adam_update_fused_chunked'))
 
@@ -121,7 +123,13 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
             group.setdefault('amsgrad', False)
 
     @torch.no_grad()
-    def step(self, closure=None, grad_scale=None, bf16_output=None, low_precision_grad=None, bf16_chunks=None):
+    def step(self,
+             closure=None,
+             grad_scale=None,
+             bf16_output=None,
+             low_precision_grad=None,
+             bf16_chunks=None,
+             preserve_gradient=True):
         """Update the model parameters.
 
         .. note::
@@ -137,8 +145,9 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
             bf16_output (Tensor, optional): CPU buffer receiving the updated BF16 parameters.
                 Requires one FP32 parameter and an AVX-512 CPUAdam build.
             low_precision_grad (Tensor, optional): CPU FP16/BF16 gradient used by the fused path.
-                The FP32 gradient buffer receives the scaled gradient for gradient APIs.
+                When preserve_gradient is true, the FP32 gradient buffer receives the scaled gradient.
             bf16_chunks (tuple, optional): Piece size and callbacks for reusing BF16 copy buffers.
+            preserve_gradient (bool): Write scaled gradients back to the FP32 buffer. Defaults to true.
 
         Returns:
             loss: if ``closure`` is provided. Otherwise ``None``.
@@ -190,6 +199,12 @@ class DeepSpeedCPUAdam(DeepSpeedCPUOptimizer):
                 state['step'] += 1
                 beta1, beta2 = group['betas']
 
+                fused_step = bf16_chunks is not None or bf16_output is not None
+                if fused_step and not self.fused_gradient_writeback_supported and not preserve_gradient:
+                    raise ValueError("gradient writeback control is not supported by this CPU Adam build")
+                if fused_step and self._fused_gradient_writeback_enabled != preserve_gradient:
+                    self.ds_opt_adam.adam_set_gradient_writeback(self.opt_id, preserve_gradient)
+                    self._fused_gradient_writeback_enabled = preserve_gradient
                 if bf16_chunks is not None:
                     piece_numel, before_piece, after_piece, buffers = bf16_chunks
                     piece_numel = max(128, piece_numel - piece_numel % 128)

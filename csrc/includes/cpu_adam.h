@@ -85,6 +85,7 @@ public:
         _bf16_output = output;
         _fused_base = base;
     }
+    void set_gradient_writeback(bool enabled) { _write_scaled_gradient = enabled; }
     void set_low_precision_gradient(const void* grad, bool is_bf16)
     {
         _low_precision_gradient = grad;
@@ -131,6 +132,7 @@ private:
     const void* _low_precision_gradient = nullptr;
     bool _low_precision_is_bf16 = false;
     float* _fused_base = nullptr;
+    bool _write_scaled_gradient = true;
     float _grad_scale = 1.0f;
     c10::BFloat16* _bf16_output = nullptr;
     float _alpha;
@@ -232,7 +234,7 @@ void Adam_Optimizer::Step_AVX(size_t* rounded_size,
                 AVX_Data scale;
                 scale.data = SIMD_SET(_grad_scale);
                 simd_mul<span>(grad_4, grad_4, scale);
-                simd_store<span>(grads + i, grad_4);
+                if (_write_scaled_gradient) simd_store<span>(grads + i, grad_4);
             }
 #endif
 
@@ -363,6 +365,7 @@ int ds_adam_step(int optimizer_id,
                  torch::Tensor& exp_avg_sq);
 
 bool ds_adam_fused_supported();
+void ds_adam_set_gradient_writeback(int optimizer_id, bool enabled);
 void ds_adam_bf16_accumulate(torch::Tensor& dst, torch::Tensor& src);
 void ds_adam_fp16_accumulate(torch::Tensor& dst, torch::Tensor& src);
 int ds_adam_step_low_precision(int optimizer_id,

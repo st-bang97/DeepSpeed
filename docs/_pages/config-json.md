@@ -530,11 +530,17 @@ reduction and offload ordering and is not covered; a warning is logged.
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
 | Enable offloading of optimizer state to CPU or NVMe, and optimizer computation to CPU. This frees up GPU memory for larger models or batch sizes. Valid for ZeRO stage 1, 2, 3. See [here](#optimizer-offloading) for more details. | `False` |
 
+***preserve_fused_optimizer_gradients***: [boolean]
+
+| Description | Default |
+| :--- | :--- |
+| Retain the scaled FP32 gradients after a fused ZeRO-3 CPUAdam optimizer step. When disabled, the fused kernel uses the scaled gradients in registers without writing them back. `safe_get_full_grad()` remains available after backward and before step; the gradient buffer after step is not guaranteed to contain the scaled gradient. | `false` |
+
 ***low_precision_gradient_offload***: [boolean]
 
 | Description | Default |
 | ----------- | ------- |
-| Offload FP16/BF16 gradient partitions before promoting them to FP32 in the AVX-512 CPUAdam kernel. Requires ZeRO-3, matching model and accumulation dtypes, pinned CPU optimizer offload, FP32 master weights and optimizer states, and DeepSpeedCPUAdam. The existing FP32 gradient buffers are retained for gradient APIs and fallback when a subgroup has unused parameters or its gradients are accessed before the optimizer step. BF16 output is generated in the existing CPU parameter buffer when parameter offload is enabled; GPU parameter partitions use the existing parameter reassignment path. | `false` |
+| Offload FP16/BF16 gradient partitions before promoting them to FP32 in the AVX-512 CPUAdam kernel. Requires ZeRO-3, matching model and accumulation dtypes, pinned CPU optimizer offload, FP32 master weights and optimizer states, and DeepSpeedCPUAdam. The existing FP32 gradient buffers are retained for gradient APIs before the optimizer step and for fallback when a subgroup has unused parameters. BF16 output is generated in the existing CPU parameter buffer when parameter offload is enabled; GPU parameter partitions use reusable pinned staging buffers. | `false` |
 
 ***cpu_bf16_gradient_accumulation***: [boolean]
 
